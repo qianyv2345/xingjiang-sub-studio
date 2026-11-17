@@ -66,7 +66,7 @@
 .venv\Scripts\python.exe -m drama_studio.app
 ```
 
-> 若从源码运行且尚未打包，请将 LGPL FFmpeg/ffprobe 放入 `vendor/ffmpeg/bin/`（包含 `ffmpeg.exe` 与 `ffprobe.exe`），或直接使用 GitHub Releases 中的 Windows 独立发行包（已内置）。
+> 若从源码运行且尚未打包，请将 LGPL FFmpeg/ffprobe 放入 `vendor/ffmpeg/bin/`（包含 `ffmpeg.exe` 与 `ffprobe.exe`），或配置系统 `PATH` / `DRAMA_STUDIO_FFMPEG_DIR` 环境变量以便自动发现；也可直接使用 GitHub Releases 中的 Windows 独立发行包（已内置）。
 
 ### 运行全部自动化测试
 ```powershell
@@ -87,3 +87,22 @@
 2. **达芬奇与本地模型共用显存**：若与 DaVinci Resolve Studio 20 同时开启且显卡为 6GB~8GB 显存，达芬奇可能会占用 2~4GB 显存；当可用显存低于 ~2.2GB 时，`Qwen3-ForcedAligner-0.6B` 会自动切换到更稳妥的 CPU 或由「自动优选」调度至轻量 `FunASR fa-zh`。
 3. **绝对原话不改写原则**：若剪映原始 SRT 本身识别错了同音字（例如把人名“顾寒川”误识为“顾汉川”），本工具的强制对齐与智能断句**不会擅自修改用户原文**，建议在剪映或本软件内先核对文字再对齐。
 4. **未下载任何对齐模型时**：程序仍可通过内置 `Silero VAD` 执行基础语音区间分布估算，但会将置信度标记为偏低并提示下载 `fa-zh` 或 `Qwen3` 模型以获得字级毫秒对齐精度。
+
+---
+
+## 五、开源许可与第三方组件致谢
+
+### 开源许可
+- **本项目源码**：采用 [MIT License](LICENSE) 开源许可协议。
+- **FFmpeg / ffprobe**：随发行包内置或作为外部子进程调用的 FFmpeg（[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) LGPL 构建）遵循 [LGPL v3](vendor/ffmpeg/LICENSE.txt) / LGPL v2.1 协议。
+- **语音模型权重**：首次使用时按需下载缓存的第三方语音模型（FunASR `fa-zh` / `paraformer-zh`、`Qwen3-ForcedAligner-0.6B` 等）遵循各自上游模型许可协议。
+
+### 第三方开源组件致谢
+本项目依赖并受益于以下优秀开源项目（完整版本、许可证与职责说明请参阅 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)，技术选型对比见 [docs/开源方案调研与技术选型.md](docs/开源方案调研与技术选型.md)）：
+
+- **媒体探测与封装**：[FFmpeg / ffprobe](https://ffmpeg.org/)（[BtbN LGPL Builds](https://github.com/BtbN/FFmpeg-Builds)）
+- **桌面图形界面**：[PySide6 (Qt for Python)](https://www.qt.io/qt-for-python)（LGPL-3.0）
+- **VAD 与语音强制对齐**：[Silero VAD](https://github.com/snakers4/silero-vad)、[ONNX Runtime](https://onnxruntime.ai/)、[FunASR](https://github.com/modelscope/FunASR)、[Qwen3-ASR (`Qwen3-ForcedAligner-0.6B`)](https://github.com/QwenLM/Qwen3-ASR)、[PyTorch](https://pytorch.org/)
+- **响度计量与音频信号处理**：[pyloudnorm](https://github.com/csteinmetz1/pyloudnorm)、[NumPy](https://numpy.org/)、[SciPy](https://scipy.org/)、[python-soundfile](https://github.com/bastibe/python-soundfile)
+- **字幕解析与中文分词**：[pysubs2](https://github.com/tkarabela/pysubs2)、[jieba](https://github.com/fxsjy/jieba)
+- **模型下载与打包分发**：[ModelScope](https://modelscope.cn/)、[Hugging Face Hub](https://github.com/huggingface/huggingface_hub)、[PyInstaller](https://pyinstaller.org/)

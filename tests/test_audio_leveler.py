@@ -11,7 +11,7 @@ import soundfile as sf
 from drama_studio.audio.leveler import process_voice_leveling
 from drama_studio.models import AudioLevelingConfig, ManualGainPoint
 
-FX = Path(r"d:\自动化\tests\fixtures")
+FX = Path(__file__).resolve().parent / "fixtures"
 
 
 def _clip_rms_db(sig: np.ndarray, sr: int, start_ms: int, end_ms: int) -> float:

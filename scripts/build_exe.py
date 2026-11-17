@@ -82,7 +82,7 @@ def main() -> int:
 
     # Copy documentation and license notices into dist/XingJiangSubStudio
     out_app_dir = dist_dir / "XingJiangSubStudio"
-    for doc in ("README.md", "THIRD_PARTY_LICENSES.md"):
+    for doc in ("README.md", "LICENSE", "THIRD_PARTY_LICENSES.md"):
         doc_p = root / doc
         if doc_p.is_file():
             shutil.copy2(doc_p, out_app_dir / doc)

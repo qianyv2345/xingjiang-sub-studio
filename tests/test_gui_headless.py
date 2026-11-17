@@ -116,7 +116,7 @@ def test_import_and_undo_redo_in_gui(tmp_path: Path) -> None:
     store = ConfigStore(base_dir=tmp_path / "cfg2")
     win = MainWindow(store=store)
 
-    fx = Path(r"d:\自动化\tests\fixtures")
+    fx = Path(__file__).resolve().parent / "fixtures"
     win.import_paths([str(fx / "第01集_粗剪.mp4"), str(fx / "第01集_粗剪.srt")])
     assert len(win.tasks) == 1
     assert win.tasks[0].episode_label == "第01集"

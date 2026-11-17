@@ -12,7 +12,7 @@ from drama_studio.media.ffmpeg_wrapper import extract_audio_to_wav, probe_media
 from drama_studio.media.pairing import assign_script_files_to_tasks, pair_media_files
 from drama_studio.models import Orientation
 
-FX = Path(r"d:\自动化\tests\fixtures")
+FX = Path(__file__).resolve().parent / "fixtures"
 
 
 def test_batch_pairing_mp4_mov_mkv_srt() -> None:

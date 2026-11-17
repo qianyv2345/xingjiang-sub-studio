@@ -1,10 +1,10 @@
 # 第三方开源组件与许可证清单
 
-本软件使用并集成了以下经过实际调研与验证的成熟开源技术组件。所有组件均按照对应开源许可证条款合规集成或作为独立命令行进程调用：
+本软件（源代码遵循 [MIT License](LICENSE)）使用并集成了以下经过实际调研与验证的成熟开源技术组件。所有组件均按照对应开源许可证条款合规集成或作为独立命令行进程调用：
 
 | 组件名称 | 验证版本 | 许可证 | 项目地址 | 在本软件中的职责 |
 | :--- | :--- | :--- | :--- | :--- |
-| **FFmpeg / ffprobe** | n8.1.3-35 (BtbN LGPL) | LGPL v2.1 / v3 | https://ffmpeg.org/ | 视频/音轨探测、时间基准偏移校验、48kHz WAV 提取、可选无损视频流 MP4 音轨封装 |
+| **FFmpeg / ffprobe** | n8.1.3-35 (BtbN LGPL) | [LGPL v3](vendor/ffmpeg/LICENSE.txt) / LGPL v2.1 | https://ffmpeg.org/ ([BtbN Builds](https://github.com/BtbN/FFmpeg-Builds)) | 视频/音轨探测、时间基准偏移校验、48kHz WAV 提取、可选无损视频流 MP4 音轨封装 |
 | **PySide6** (`PySide6-Essentials`, `PySide6-Addons`) | 6.12.0 | LGPL-3.0 | https://www.qt.io/qt-for-python | Windows 11 原生图形界面、HiDPI 波形时间轴绘制、`QtMultimedia` A/B 试听 |
 | **Silero VAD** | 6.2.3 | MIT | https://github.com/snakers4/silero-vad | ONNX 语音活动检测，精准分离人声、停顿与底噪区间 |
 | **ONNX Runtime** | 1.32.0 | MIT | https://onnxruntime.ai/ | 轻量推理运行时，免 PyTorch 依赖极速执行 Silero VAD |
@@ -14,8 +14,8 @@
 | **pysubs2** | 1.9.1 | MIT | https://github.com/tkarabela/pysubs2 | SRT 字幕文件结构化解析与格式基础支持 |
 | **jieba / jieba_pyfast** | 0.42.1 / 4.0.1 | MIT | https://github.com/fxsjy/jieba | 中文分词与词性标注，用于智能语义断句边界与词组保护 |
 | **PyTorch / torchaudio** | 2.8.0+cu126 | BSD-3-Clause | https://pytorch.org/ | GPU CUDA / CPU 神经网络强制对齐计算引擎 |
-| **NumPy / SciPy / soundfile** | 2.5.4 / 1.18.1 / 0.14.0 | BSD-3-Clause | https://scipy.org/ | 48kHz 多声道重采样、滤波、软拐点压缩、前瞻真峰值限制与 WAV 读写 |
-| **ModelScope / huggingface-hub** | 1.40.3 / 0.36.2 | Apache-2.0 | https://modelscope.cn/ | 首次运行按需下载并缓存本地开源语音模型 |
+| **NumPy / SciPy / soundfile** | 2.5.4 / 1.18.1 / 0.14.0 | BSD-3-Clause | https://numpy.org/ · https://scipy.org/ · https://github.com/bastibe/python-soundfile | 48kHz 多声道重采样、滤波、软拐点压缩、前瞻真峰值限制与 WAV 读写 |
+| **ModelScope / huggingface-hub** | 1.40.3 / 0.36.2 | Apache-2.0 | https://modelscope.cn/ · https://github.com/huggingface/huggingface_hub | 首次运行按需下载并缓存本地开源语音模型 |
 | **PyInstaller** | 6.22.3 | GPL v2 (含商业/独立应用打包例外) | https://pyinstaller.org/ | Windows 11 独立可执行程序打包分发 |
 
 ## 调研对比但未作为核心默认路径的参考开源项目

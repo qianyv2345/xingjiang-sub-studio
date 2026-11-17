@@ -11,7 +11,7 @@ import soundfile as sf
 from drama_studio.align.model_manager import is_model_cached
 from drama_studio.app import configure_runtime_environment
 from drama_studio.config import default_model_cache_dir
-from drama_studio.media.ffmpeg_wrapper import probe_media
+from drama_studio.media.ffmpeg_wrapper import find_ffmpeg_binaries, probe_media
 from drama_studio.models import (
     AlignmentConfig,
     AnomalyType,
@@ -25,7 +25,7 @@ from drama_studio.nlp.segmenter import measure_text_width, width_fits_limit
 from drama_studio.nlp.srt_io import load_srt
 from drama_studio.pipeline import process_single_episode
 
-FX = Path(r"d:\自动化\tests\fixtures")
+FX = Path(__file__).resolve().parent / "fixtures"
 
 
 def _run_and_verify_backend(backend_name: str, tmp_path: Path, max_lines: int, max_chars: int) -> None:
@@ -133,12 +133,23 @@ def test_silent_region_anomaly_detection(tmp_path: Path) -> None:
 
     sf.write(str(silent_wav), np.zeros((48000 * 4, 2), dtype=np.float32), 48000, subtype="PCM_16")
     silent_mp4 = tmp_path / "silent.mp4"
+    ffmpeg_bin, _ = find_ffmpeg_binaries()
+    enc_proc = subprocess.run(
+        [str(ffmpeg_bin), "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    enc_out = enc_proc.stdout or ""
+    vcodec = next((c for c in ("libopenh264", "libx264", "mpeg4") if c in enc_out), "mpeg4")
     subprocess.run(
         [
-            r"d:\自动化\vendor\ffmpeg\bin\ffmpeg.exe", "-y",
+            str(ffmpeg_bin), "-y",
             "-f", "lavfi", "-i", "color=c=black:s=720x1280:r=25:d=4",
             "-i", str(silent_wav),
-            "-c:v", "libopenh264", "-c:a", "aac", "-shortest", str(silent_mp4),
+            "-c:v", vcodec, "-c:a", "aac", "-shortest", str(silent_mp4),
         ],
         check=True,
         capture_output=True,

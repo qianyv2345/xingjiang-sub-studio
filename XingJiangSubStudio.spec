@@ -1,11 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.hooks import copy_metadata
 
-datas = [('D:/自动化/assets', 'assets')]
-binaries = [('D:/自动化/vendor/ffmpeg/bin/ffmpeg.exe', 'ffmpeg/bin'), ('D:/自动化/vendor/ffmpeg/bin/ffprobe.exe', 'ffmpeg/bin')]
+ROOT = Path(SPECPATH)
+datas = [(str(ROOT / 'assets'), 'assets')]
+binaries = [
+    (str(ROOT / 'vendor/ffmpeg/bin/ffmpeg.exe'), 'ffmpeg/bin'),
+    (str(ROOT / 'vendor/ffmpeg/bin/ffprobe.exe'), 'ffmpeg/bin'),
+]
 hiddenimports = []
 datas += collect_data_files('silero_vad')
 datas += collect_data_files('jieba')
@@ -34,8 +40,8 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['D:/自动化/src/drama_studio/app.py'],
-    pathex=['D:/自动化/src'],
+    [str(ROOT / 'src/drama_studio/app.py')],
+    pathex=[str(ROOT / 'src')],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -64,7 +70,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:/自动化/assets/app_icon.ico'],
+    icon=[str(ROOT / 'assets/app_icon.ico')],
 )
 coll = COLLECT(
     exe,
