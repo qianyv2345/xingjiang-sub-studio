@@ -1,0 +1,23 @@
+# Python & virtualenv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller build & release outputs (uploaded via GitHub Releases)
+build/
+dist/
+*.spec.bak
+
+# Large binary dependencies exceeding GitHub 100MB file limit (bundled in Releases)
+vendor/ffmpeg/bin/*.exe
+
+# Logs, temp outputs, OS files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+智能修正输出/

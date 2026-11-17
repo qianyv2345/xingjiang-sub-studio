@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drama-studio"
+version = "1.0.0"
+description = "星酱声幕 · AI 短剧智能音频与字幕修正助手 (DaVinci Resolve Studio 20 / 剪映工作流)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "PySide6-Essentials>=6.10.0",
+    "PySide6-Addons>=6.10.0",
+    "numpy>=2.0.0",
+    "scipy>=1.14.0",
+    "soundfile>=0.12.1",
+    "pysubs2>=1.9.0",
+    "pyloudnorm>=0.2.0",
+    "silero-vad>=6.0.0",
+    "onnxruntime>=1.18.0",
+    "jieba>=0.42.1",
+    "jieba-pyfast>=4.0.0",
+    "funasr>=1.4.0",
+    "modelscope>=1.30.0",
+    "torch>=2.6.0",
+    "torchaudio>=2.6.0",
+]
+
+[project.optional-dependencies]
+qwen = [
+    "qwen-asr>=0.0.6",
+    "transformers==4.57.6",
+    "accelerate>=1.0.0",
+]
+nlp-heavy = [
+    "hanlp>=2.1.7",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pyinstaller>=6.10.0",
+    "edge-tts>=6.1.0",
+]
+
+[project.gui-scripts]
+drama-studio = "drama_studio.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
