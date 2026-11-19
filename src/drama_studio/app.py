@@ -19,7 +19,16 @@ from drama_studio.media.ffmpeg_wrapper import find_ffmpeg_binaries
 
 
 def configure_runtime_environment() -> None:
-    """Inject bundled FFmpeg into PATH and silence harmless third-party Python 3.12 SyntaxWarnings."""
+    """Inject bundled FFmpeg into PATH, apply Windows Qwen safeguard, and prevent CPU thread starvation."""
+    from drama_studio.align.runtime import ensure_qwen_windows_safe
+
+    # Cap BLAS/OpenMP worker threads so heavy DSP/ML workers cannot starve the Windows Qt UI thread
+    safe_threads = str(min(4, max(2, (os.cpu_count() or 4) // 2)))
+    os.environ.setdefault("OMP_NUM_THREADS", safe_threads)
+    os.environ.setdefault("MKL_NUM_THREADS", safe_threads)
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", safe_threads)
+
+    ensure_qwen_windows_safe()
     warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"jieba.*")
     warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"pydub.*")
 
@@ -73,6 +82,16 @@ def main() -> int:
         from drama_studio.nlp.segmenter import tokenize_with_pos
         toks = tokenize_with_pos("测试中文分词")
         assert len(toks) > 0
+        from importlib import util as importlib_util
+        if importlib_util.find_spec("librosa") is not None:
+            import librosa
+            assert hasattr(librosa, "resample")
+        if importlib_util.find_spec("qwen_asr") is not None:
+            from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner
+            assert Qwen3ASRModel is not None and Qwen3ForcedAligner is not None
+        from drama_studio.cache import stable_param_hash
+        from drama_studio.nlp.script_matcher import match_asr_to_script
+        assert callable(stable_param_hash) and callable(match_asr_to_script)
         win.template_panel.chars_slider.setValue(14)
         win.template_panel.btn_2line.click()
         assert win.template_panel.current_template().max_lines == 2

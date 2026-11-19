@@ -16,12 +16,13 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
-    QMessageBox,
+        QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -31,11 +32,15 @@ from drama_studio.gui.theme import normalize_theme_mode
 from drama_studio.gui.widgets.glass_card import GlassCard
 from drama_studio.gui.widgets.themed_controls import AnimatedSegmentTrack, ThemedComboBox
 from drama_studio.models import SubtitleTemplate
+from drama_studio.nlp.punctuation import count_english_words
 from drama_studio.nlp.segmenter import (
     build_unit_tokens,
     measure_text_width,
     segment_tokens_dp,
 )
+
+_DEFAULT_ZH_SAMPLE = "顾寒川，你别以为这样就能让我低头，这三千万我会一分不少还给你！"
+_DEFAULT_EN_SAMPLE = "I don't know what you're talking about, Dr. Smith!"
 
 
 class LiveSubtitlePreviewBox(GlassCard):
@@ -124,19 +129,34 @@ class LiveSubtitlePreviewBox(GlassCard):
             self.sample_input.setText(custom_text.replace("\n", " "))
             self.sample_input.setCursorPosition(0)
             self.sample_input.blockSignals(False)
-
-        text = self.sample_input.text().strip() or "这件事情没有你想的那么简单"
-        if template.aspect_preset == "9:16":
-            self.stage_frame.setFixedSize(102, 44)
         else:
-            self.stage_frame.setFixedSize(224, 44)
+            cur_sample = self.sample_input.text().strip()
+            if template.language == "en" and cur_sample == _DEFAULT_ZH_SAMPLE:
+                self.sample_input.blockSignals(True)
+                self.sample_input.setText(_DEFAULT_EN_SAMPLE)
+                self.sample_input.setCursorPosition(0)
+                self.sample_input.blockSignals(False)
+            elif template.language == "zh" and cur_sample == _DEFAULT_EN_SAMPLE:
+                self.sample_input.blockSignals(True)
+                self.sample_input.setText(_DEFAULT_ZH_SAMPLE)
+                self.sample_input.setCursorPosition(0)
+                self.sample_input.blockSignals(False)
+
+        text = self.sample_input.text().strip() or (
+            _DEFAULT_EN_SAMPLE if template.language == "en" else "这件事情没有你想的那么简单"
+        )
+        if template.aspect_preset == "9:16":
+            self.stage_frame.setFixedSize(108 if template.language == "en" else 102, 46)
+        else:
+            self.stage_frame.setFixedSize(236, 46)
 
         tokens = build_unit_tokens(
             text,
             [],
             fallback_start_ms=0,
-            fallback_end_ms=max(1200, len(text) * 200),
+            fallback_end_ms=max(1200, len(text) * 140),
             nlp_backend="jieba",
+            language=template.language,
         )
         if template.smart_semantic_split and tokens:
             segs = segment_tokens_dp(tokens, template)
@@ -147,10 +167,16 @@ class LiveSubtitlePreviewBox(GlassCard):
         first_cue = preview_lines[0] if preview_lines else ""
         self.sub_label.setText(first_cue)
 
-        max_w = max((measure_text_width(p, template.width_mode) for p in preview_lines), default=0.0)
+        eff_wm = "strict" if template.language == "en" else template.width_mode
+        max_w = max((measure_text_width(p, eff_wm) for p in preview_lines), default=0.0)
+        unit_lbl = "字符" if template.language == "en" else "字"
+        extra_en = ""
+        if template.language == "en" and "\n" in first_cue:
+            l1, l2 = first_cue.splitlines()[:2]
+            extra_en = f" · L1:{count_english_words(l1)}词/L2:{count_english_words(l2)}词"
         self.metrics_lbl.setText(
-            f"智能切分 {len(preview_lines)} 条 · 首条宽 {max_w:.1f}/{template.max_chars_per_line} 字 · "
-            f"{'2行模式' if template.max_lines >= 2 else '1行模式'}"
+            f"智能切分 {len(preview_lines)} 条 · 首条宽 {max_w:.1f}/{template.max_chars_per_line} {unit_lbl} · "
+            f"{'2行模式' if template.max_lines >= 2 else '1行模式'}{extra_en}"
         )
         numbered = "  |  ".join(f"[{i+1}] {p.replace(chr(10), ' ↵ ')}" for i, p in enumerate(preview_lines))
         self.all_cues_lbl.setText(f"完整切分：{numbered}")
@@ -183,26 +209,31 @@ class TemplateSettingsPanel(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        outer.addWidget(scroll, 1)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, 1)
 
-        container = QWidget()
-        container.setObjectName("TransparentContainer")
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 8, 2)
-        layout.setSpacing(5)
-        scroll.setWidget(container)
+        # ---- Tab 1: Basic Presets & Core Layout Controls ----
+        basic_scroll = QScrollArea()
+        basic_scroll.setWidgetResizable(True)
+        basic_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        basic_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        basic_container = QWidget()
+        basic_container.setObjectName("TransparentContainer")
+        layout = QVBoxLayout(basic_container)
+        layout.setContentsMargins(4, 6, 6, 4)
+        layout.setSpacing(6)
+        basic_scroll.setWidget(basic_container)
+        self.tabs.addTab(basic_scroll, "核心排版与预设")
 
         # --- Card 1: Template Management ---
         tpl_card = GlassCard("字幕模板预设管理")
         tpl_card.layout().setContentsMargins(12, 9, 12, 9)
         tpl_card.body().setSpacing(4)
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("当前模板:"))
+        row1.addWidget(QLabel("模板:"))
         self.tpl_combo = ThemedComboBox()
+        self.tpl_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.tpl_combo.setMinimumContentsLength(10)
         self.tpl_combo.currentIndexChanged.connect(self._on_template_selected)
         row1.addWidget(self.tpl_combo, 1)
         tpl_card.body().addLayout(row1)
@@ -214,7 +245,18 @@ class TemplateSettingsPanel(QWidget):
         self.btn_rename_tpl = QPushButton("重命名")
         self.btn_copy_tpl = QPushButton("复制")
         self.btn_del_tpl = QPushButton("删除")
-        self.btn_reset_default = QPushButton("恢复预设默认")
+        self.btn_reset_default = QPushButton("恢复默认")
+        self.btn_reset_default.setToolTip("恢复系统内置模板默认参数")
+        for b in (
+            self.btn_save_tpl,
+            self.btn_save_as_tpl,
+            self.btn_rename_tpl,
+            self.btn_copy_tpl,
+            self.btn_del_tpl,
+            self.btn_reset_default,
+        ):
+            b.setMinimumWidth(0)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         btn_grid.addWidget(self.btn_save_tpl, 0, 0)
         btn_grid.addWidget(self.btn_save_as_tpl, 0, 1)
         btn_grid.addWidget(self.btn_rename_tpl, 0, 2)
@@ -241,24 +283,37 @@ class TemplateSettingsPanel(QWidget):
         core_card.layout().setContentsMargins(12, 9, 12, 9)
         core_card.body().setSpacing(4)
 
-        # Aspect Preset Segmented Track
+        # Aspect / Language Preset Segmented Track
         preset_track = AnimatedSegmentTrack()
-        self.btn_preset_916 = QPushButton("竖屏 9:16 (9字)")
-        self.btn_preset_169 = QPushButton("横屏 16:9 (20字)")
+        self.btn_preset_916 = QPushButton("竖屏 9:16")
+        self.btn_preset_169 = QPushButton("横屏 16:9")
+        self.btn_preset_en = QPushButton("EN 26字")
+        for b in (self.btn_preset_916, self.btn_preset_169, self.btn_preset_en):
+            b.setMinimumWidth(0)
+            b.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.preset_group = QButtonGroup(self)
         self.preset_group.setExclusive(True)
         self.preset_group.addButton(self.btn_preset_916, 0)
         self.preset_group.addButton(self.btn_preset_169, 1)
+        self.preset_group.addButton(self.btn_preset_en, 2)
         preset_track.add_segment(self.btn_preset_916, 1)
         preset_track.add_segment(self.btn_preset_169, 1)
+        preset_track.add_segment(self.btn_preset_en, 1)
         core_card.body().addWidget(preset_track)
         self.btn_preset_916.clicked.connect(lambda: self.apply_aspect_preset("9:16"))
         self.btn_preset_169.clicked.connect(lambda: self.apply_aspect_preset("16:9"))
+        self.btn_preset_en.clicked.connect(lambda: self.apply_aspect_preset("en"))
 
-        # Max chars per line (Hero Slider + Big Readout + Exact SpinBox)
+        # Language selector & Max chars per line
         chars_hdr = QHBoxLayout()
-        chars_hdr.addWidget(QLabel("每行最多字数"))
-        chars_hdr.addStretch()
+        chars_hdr.addWidget(QLabel("语言:"))
+        self.combo_tpl_lang = ThemedComboBox()
+        self.combo_tpl_lang.addItem("中文 (按字/视觉宽)", "zh")
+        self.combo_tpl_lang.addItem("English (严格字符)", "en")
+        self.combo_tpl_lang.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_tpl_lang.setMinimumContentsLength(8)
+        self.combo_tpl_lang.currentIndexChanged.connect(self._on_tpl_lang_changed)
+        chars_hdr.addWidget(self.combo_tpl_lang, 1)
         self.chars_live_label = QLabel("9 字")
         self.chars_live_label.setObjectName("BigValueLabel")
         chars_hdr.addWidget(self.chars_live_label)
@@ -267,11 +322,11 @@ class TemplateSettingsPanel(QWidget):
         chars_ctrl = QHBoxLayout()
         chars_ctrl.setSpacing(8)
         self.chars_slider = QSlider(Qt.Orientation.Horizontal)
-        self.chars_slider.setRange(5, 40)
+        self.chars_slider.setRange(5, 45)
         self.chars_spin = QSpinBox()
-        self.chars_spin.setRange(5, 40)
+        self.chars_spin.setRange(5, 45)
         self.chars_spin.setSuffix(" 字")
-        self.chars_spin.setMinimumWidth(84)
+        self.chars_spin.setMinimumWidth(88)
         self.chars_spin.setMinimumHeight(29)
         chars_ctrl.addWidget(self.chars_slider, 1)
         chars_ctrl.addWidget(self.chars_spin)
@@ -298,84 +353,141 @@ class TemplateSettingsPanel(QWidget):
         self.btn_2line.clicked.connect(lambda: self._on_lines_changed(2))
 
         layout.addWidget(core_card)
+        layout.addStretch()
 
-        # --- Card 3: NLP, Punctuation & Timing Options ---
-        opt_card = GlassCard("智能断句 · 标点 · 时长控制")
-        opt_card.layout().setContentsMargins(12, 9, 12, 9)
-        opt_card.body().setSpacing(4)
+        # ---- Tab 2: Advanced NLP, Bilingual Rules & Timing Constraints ----
+        adv_scroll = QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        adv_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        adv_container = QWidget()
+        adv_container.setObjectName("TransparentContainer")
+        adv_lay = QVBoxLayout(adv_container)
+        adv_lay.setContentsMargins(4, 6, 6, 4)
+        adv_lay.setSpacing(6)
+        adv_scroll.setWidget(adv_container)
+        self.tabs.addTab(adv_scroll, "高级断句与时长规则")
+
+        nlp_card = GlassCard("智能断句 · 标点 · 双语词数规则")
+        nlp_card.layout().setContentsMargins(12, 9, 12, 9)
+        nlp_card.body().setSpacing(6)
         self.chk_smart_split = QCheckBox("智能语义断句")
         self.chk_remove_punct = QCheckBox("自动去除标点")
         self.chk_auto_merge = QCheckBox("合并过短碎句")
         self.chk_auto_split = QCheckBox("拆分超限长句")
-        self.chk_smart_split.setToolTip("结合 NLP 分词、词性保护、真实停顿与动态规划全局断句")
-        self.chk_remove_punct.setToolTip("去除常规显示标点，智能保留小数点(3.14)、千分位与英文连接符(AI-2026)")
+        self.chk_balance_lines = QCheckBox("平衡双行长度")
+        self.chk_smart_split.setToolTip("结合分词/语义边界、词性保护、真实停顿与动态规划全局断句")
+        self.chk_remove_punct.setToolTip("去除常规显示标点，智能保留小数点(3.14)、英文撇号(don't/you're)与缩写(Dr./U.S.)")
 
         chk_grid = QGridLayout()
-        chk_grid.setSpacing(3)
+        chk_grid.setSpacing(4)
         chk_grid.addWidget(self.chk_smart_split, 0, 0)
         chk_grid.addWidget(self.chk_remove_punct, 0, 1)
         chk_grid.addWidget(self.chk_auto_merge, 1, 0)
         chk_grid.addWidget(self.chk_auto_split, 1, 1)
-        for cb in (self.chk_smart_split, self.chk_remove_punct, self.chk_auto_merge, self.chk_auto_split):
+        chk_grid.addWidget(self.chk_balance_lines, 2, 0, 1, 2)
+        for cb in (
+            self.chk_smart_split,
+            self.chk_remove_punct,
+            self.chk_auto_merge,
+            self.chk_auto_split,
+            self.chk_balance_lines,
+        ):
             cb.toggled.connect(self._emit_template_update)
-        opt_card.body().addLayout(chk_grid)
+        nlp_card.body().addLayout(chk_grid)
+
+        en_row = QHBoxLayout()
+        en_row.setSpacing(6)
+        en_row.addWidget(QLabel("英文1行词数≥"))
+        self.spin_min_words_l1 = QSpinBox()
+        self.spin_min_words_l1.setRange(1, 5)
+        self.spin_min_words_l1.setMinimumWidth(52)
+        self.spin_min_words_l1.setMinimumHeight(26)
+        self.spin_min_words_l1.valueChanged.connect(self._emit_template_update)
+        en_row.addWidget(self.spin_min_words_l1)
+        en_row.addWidget(QLabel("2行词数≥"))
+        self.spin_min_words_l2 = QSpinBox()
+        self.spin_min_words_l2.setRange(1, 6)
+        self.spin_min_words_l2.setMinimumWidth(52)
+        self.spin_min_words_l2.setMinimumHeight(26)
+        self.spin_min_words_l2.valueChanged.connect(self._emit_template_update)
+        en_row.addWidget(self.spin_min_words_l2)
+        en_row.addStretch()
+        nlp_card.body().addLayout(en_row)
 
         w_row = QHBoxLayout()
-        w_row.addWidget(QLabel("字宽计算:"))
+        w_row.addWidget(QLabel("字宽:"))
         self.combo_width_mode = ThemedComboBox()
         self.combo_width_mode.addItem("视觉等效 (英文数字 0.55字)", "visual")
         self.combo_width_mode.addItem("严格计数 (每字符 1字)", "strict")
+        self.combo_width_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_width_mode.setMinimumContentsLength(10)
         self.combo_width_mode.currentIndexChanged.connect(self._emit_template_update)
         w_row.addWidget(self.combo_width_mode, 1)
-        opt_card.body().addLayout(w_row)
+        nlp_card.body().addLayout(w_row)
+        adv_lay.addWidget(nlp_card)
+
+        timing_card = GlassCard("显示时长 · 阅读速度 · 安全留白")
+        timing_card.layout().setContentsMargins(12, 9, 12, 9)
+        timing_card.body().setSpacing(6)
 
         p_grid = QGridLayout()
-        p_grid.setSpacing(4)
+        p_grid.setSpacing(5)
+        p_grid.setColumnStretch(1, 1)
 
         self.spin_min_dur = QSpinBox()
         self.spin_min_dur.setRange(150, 3000)
         self.spin_min_dur.setSingleStep(50)
         self.spin_min_dur.setSuffix(" ms")
-        self.spin_min_dur.setMinimumWidth(98)
+        self.spin_min_dur.setMinimumWidth(0)
 
         self.spin_max_dur = QSpinBox()
         self.spin_max_dur.setRange(1500, 15000)
         self.spin_max_dur.setSingleStep(250)
         self.spin_max_dur.setSuffix(" ms")
-        self.spin_max_dur.setMinimumWidth(98)
+        self.spin_max_dur.setMinimumWidth(0)
 
         self.spin_max_cps = QDoubleSpinBox()
         self.spin_max_cps.setRange(4.0, 30.0)
         self.spin_max_cps.setSingleStep(0.5)
         self.spin_max_cps.setSuffix(" 字/s")
-        self.spin_max_cps.setMinimumWidth(98)
+        self.spin_max_cps.setMinimumWidth(0)
 
         self.spin_min_gap = QSpinBox()
         self.spin_min_gap.setRange(0, 500)
         self.spin_min_gap.setSingleStep(10)
         self.spin_min_gap.setSuffix(" ms")
-        self.spin_min_gap.setMinimumWidth(98)
+        self.spin_min_gap.setMinimumWidth(0)
 
         self.combo_padding_unit = ThemedComboBox()
         self.combo_padding_unit.addItem("按帧数 (随视频帧率)", "frames")
         self.combo_padding_unit.addItem("按毫秒 (固定 ms)", "ms")
+        self.combo_padding_unit.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_padding_unit.setMinimumContentsLength(8)
         self.combo_padding_unit.setToolTip("预留空间可按视频帧数（推荐，默认前后各 3 帧）或固定毫秒自定义设置")
         self.combo_padding_unit.currentIndexChanged.connect(self._on_padding_unit_changed)
 
         self.lbl_padding_hint = QLabel("前120/后120ms@25fps")
         self.lbl_padding_hint.setObjectName("MutedLabel")
+        self.lbl_padding_hint.setWordWrap(True)
 
         self.spin_lead_offset = QSpinBox()
         self.spin_lead_offset.setRange(-10, 30)
         self.spin_lead_offset.setSingleStep(1)
         self.spin_lead_offset.setSuffix(" 帧")
-        self.spin_lead_offset.setMinimumWidth(98)
+        self.spin_lead_offset.setMinimumWidth(0)
+        self.spin_lead_offset.setToolTip(
+            "字幕提前入场缓冲（仅向句前真实静音/停顿区间扩展；若与上一条为连续不断句对话，会自动保持原字边界不抢跑）。"
+        )
 
         self.spin_tail_offset = QSpinBox()
         self.spin_tail_offset.setRange(-10, 30)
         self.spin_tail_offset.setSingleStep(1)
         self.spin_tail_offset.setSuffix(" 帧")
-        self.spin_tail_offset.setMinimumWidth(98)
+        self.spin_tail_offset.setMinimumWidth(0)
+        self.spin_tail_offset.setToolTip(
+            "字幕延后退场缓冲（仅向句末真实静音/停顿区间扩展，不挤压下一条已开口发音的时间边界）。"
+        )
 
         self.chk_bridge_gaps = QCheckBox("同句衔接防闪烁")
         self.chk_bridge_gaps.setToolTip(
@@ -386,7 +498,7 @@ class TemplateSettingsPanel(QWidget):
         self.spin_bridge_gap.setRange(50, 1500)
         self.spin_bridge_gap.setSingleStep(50)
         self.spin_bridge_gap.setSuffix(" ms")
-        self.spin_bridge_gap.setMinimumWidth(98)
+        self.spin_bridge_gap.setMinimumWidth(0)
 
         for sp in (
             self.spin_min_dur,
@@ -397,50 +509,39 @@ class TemplateSettingsPanel(QWidget):
             self.spin_tail_offset,
             self.spin_bridge_gap,
         ):
-            sp.setMinimumHeight(25)
+            sp.setMinimumHeight(26)
             sp.valueChanged.connect(self._emit_template_update)
         self.chk_bridge_gaps.toggled.connect(self._emit_template_update)
 
         p_grid.addWidget(QLabel("最短显示:"), 0, 0)
         p_grid.addWidget(self.spin_min_dur, 0, 1)
-        p_grid.addWidget(QLabel("最长显示:"), 0, 2)
-        p_grid.addWidget(self.spin_max_dur, 0, 3)
+        p_grid.addWidget(QLabel("最长显示:"), 1, 0)
+        p_grid.addWidget(self.spin_max_dur, 1, 1)
+        p_grid.addWidget(QLabel("阅读速度:"), 2, 0)
+        p_grid.addWidget(self.spin_max_cps, 2, 1)
+        p_grid.addWidget(QLabel("最小间隔:"), 3, 0)
+        p_grid.addWidget(self.spin_min_gap, 3, 1)
+        p_grid.addWidget(QLabel("预留单位:"), 4, 0)
+        p_grid.addWidget(self.combo_padding_unit, 4, 1)
+        p_grid.addWidget(QLabel("前预留:"), 5, 0)
+        p_grid.addWidget(self.spin_lead_offset, 5, 1)
+        p_grid.addWidget(QLabel("后预留:"), 6, 0)
+        p_grid.addWidget(self.spin_tail_offset, 6, 1)
+        p_grid.addWidget(self.chk_bridge_gaps, 7, 0)
+        p_grid.addWidget(self.spin_bridge_gap, 7, 1)
 
-        p_grid.addWidget(QLabel("阅读速度:"), 1, 0)
-        p_grid.addWidget(self.spin_max_cps, 1, 1)
-        p_grid.addWidget(QLabel("最小间隔:"), 1, 2)
-        p_grid.addWidget(self.spin_min_gap, 1, 3)
-
-        pad_unit_row = QHBoxLayout()
-        pad_unit_row.setSpacing(6)
-        pad_unit_row.addWidget(QLabel("预留空间:"))
-        pad_unit_row.addWidget(self.combo_padding_unit, 1)
-        pad_unit_row.addWidget(self.lbl_padding_hint)
-        opt_card.body().addLayout(p_grid)
-        opt_card.body().addLayout(pad_unit_row)
-
-        p2_grid = QGridLayout()
-        p2_grid.setSpacing(4)
-        p2_grid.addWidget(QLabel("前预留:"), 0, 0)
-        p2_grid.addWidget(self.spin_lead_offset, 0, 1)
-        p2_grid.addWidget(QLabel("后预留:"), 0, 2)
-        p2_grid.addWidget(self.spin_tail_offset, 0, 3)
-
-        p2_grid.addWidget(self.chk_bridge_gaps, 1, 0, 1, 2)
-        p2_grid.addWidget(QLabel("衔接上限:"), 1, 2)
-        p2_grid.addWidget(self.spin_bridge_gap, 1, 3)
-
-        opt_card.body().addLayout(p2_grid)
-        layout.addWidget(opt_card)
+        timing_card.body().addLayout(p_grid)
+        timing_card.body().addWidget(self.lbl_padding_hint)
+        adv_lay.addWidget(timing_card)
+        adv_lay.addStretch()
 
         # --- Card 4: Pinned Live Subtitle Preview ---
         self.preview_box = LiveSubtitlePreviewBox()
         self.preview_box.sample_input.textChanged.connect(
             lambda: self.preview_box.update_preview(self._template)
         )
-        layout.addStretch()
         preview_wrap = QHBoxLayout()
-        preview_wrap.setContentsMargins(0, 0, 14, 0)
+        preview_wrap.setContentsMargins(0, 0, 4, 0)
         preview_wrap.addWidget(self.preview_box)
         outer.addLayout(preview_wrap)
 
@@ -463,12 +564,18 @@ class TemplateSettingsPanel(QWidget):
         self._loading = True
         self._template = deepcopy(tpl)
 
-        self.btn_preset_916.setChecked(tpl.aspect_preset == "9:16")
-        self.btn_preset_169.setChecked(tpl.aspect_preset == "16:9")
+        self.btn_preset_en.setChecked(tpl.language == "en")
+        self.btn_preset_916.setChecked(tpl.language != "en" and tpl.aspect_preset == "9:16")
+        self.btn_preset_169.setChecked(tpl.language != "en" and tpl.aspect_preset == "16:9")
 
-        self.chars_slider.setValue(max(5, min(40, tpl.max_chars_per_line)))
-        self.chars_spin.setValue(max(5, min(40, tpl.max_chars_per_line)))
-        self.chars_live_label.setText(f"{tpl.max_chars_per_line} 字")
+        l_idx = self.combo_tpl_lang.findData(tpl.language)
+        self.combo_tpl_lang.setCurrentIndex(max(0, l_idx))
+        unit_suffix = " 字符" if tpl.language == "en" else " 字"
+        self.chars_spin.setSuffix(unit_suffix)
+
+        self.chars_slider.setValue(max(5, min(45, tpl.max_chars_per_line)))
+        self.chars_spin.setValue(max(5, min(45, tpl.max_chars_per_line)))
+        self.chars_live_label.setText(f"{tpl.max_chars_per_line}{unit_suffix}")
 
         self.btn_1line.setChecked(tpl.max_lines == 1)
         self.btn_2line.setChecked(tpl.max_lines >= 2)
@@ -477,6 +584,11 @@ class TemplateSettingsPanel(QWidget):
         self.chk_remove_punct.setChecked(tpl.remove_punctuation)
         self.chk_auto_merge.setChecked(tpl.auto_merge_short)
         self.chk_auto_split.setChecked(tpl.auto_split_long)
+        self.chk_balance_lines.setChecked(tpl.balance_two_lines)
+        self.spin_min_words_l1.setValue(max(1, tpl.min_words_line1))
+        self.spin_min_words_l2.setValue(max(1, tpl.min_words_line2))
+        self.spin_min_words_l1.setEnabled(tpl.language == "en")
+        self.spin_min_words_l2.setEnabled(tpl.language == "en")
 
         widx = self.combo_width_mode.findData(tpl.width_mode)
         self.combo_width_mode.setCurrentIndex(max(0, widx))
@@ -504,10 +616,32 @@ class TemplateSettingsPanel(QWidget):
             self.templateChanged.emit(self.current_template())
 
     def apply_aspect_preset(self, aspect: str, *, keep_custom_if_modified: bool = False) -> None:
-        preset = SubtitleTemplate.preset_portrait_9_16() if aspect == "9:16" else SubtitleTemplate.preset_landscape_16_9()
+        if aspect == "en":
+            preset = SubtitleTemplate.preset_english_default()
+        elif aspect == "9:16":
+            preset = SubtitleTemplate.preset_portrait_9_16()
+        else:
+            preset = SubtitleTemplate.preset_landscape_16_9()
         if keep_custom_if_modified and not self._template.is_builtin:
             return
         self.set_template(preset, emit_signal=True)
+
+    def _on_tpl_lang_changed(self, _idx: int) -> None:
+        if self._loading:
+            return
+        lang = self.combo_tpl_lang.currentData() or "zh"
+        if lang == "en":
+            self._template.language = "en"
+            self._template.width_mode = "strict"
+            if self._template.is_builtin and self._template.template_id in {"preset_9_16", "preset_16_9"}:
+                self.set_template(SubtitleTemplate.preset_english_default(), emit_signal=True)
+                return
+        else:
+            self._template.language = "zh"
+            if self._template.is_builtin and self._template.template_id.startswith("preset_en"):
+                self.set_template(SubtitleTemplate.preset_portrait_9_16(), emit_signal=True)
+                return
+        self.set_template(self._template, emit_signal=True)
 
     def _update_template_buttons_state(self) -> None:
         is_builtin = self._template.is_builtin
@@ -518,14 +652,16 @@ class TemplateSettingsPanel(QWidget):
         self.chars_spin.blockSignals(True)
         self.chars_spin.setValue(val)
         self.chars_spin.blockSignals(False)
-        self.chars_live_label.setText(f"{val} 字")
+        unit_suffix = " 字符" if self._template.language == "en" else " 字"
+        self.chars_live_label.setText(f"{val}{unit_suffix}")
         self._emit_template_update()
 
     def _on_chars_spin_changed(self, val: int) -> None:
         self.chars_slider.blockSignals(True)
         self.chars_slider.setValue(val)
         self.chars_slider.blockSignals(False)
-        self.chars_live_label.setText(f"{val} 字")
+        unit_suffix = " 字符" if self._template.language == "en" else " 字"
+        self.chars_live_label.setText(f"{val}{unit_suffix}")
         self._emit_template_update()
 
     def _on_lines_changed(self, lines: int) -> None:
@@ -582,13 +718,17 @@ class TemplateSettingsPanel(QWidget):
         if self._loading:
             return
         t = self._template
+        t.language = self.combo_tpl_lang.currentData() or "zh"
         t.max_chars_per_line = self.chars_spin.value()
         t.max_lines = 2 if self.btn_2line.isChecked() else 1
+        t.min_words_line1 = self.spin_min_words_l1.value()
+        t.min_words_line2 = self.spin_min_words_l2.value()
+        t.balance_two_lines = self.chk_balance_lines.isChecked()
         t.smart_semantic_split = self.chk_smart_split.isChecked()
         t.remove_punctuation = self.chk_remove_punct.isChecked()
         t.auto_merge_short = self.chk_auto_merge.isChecked()
         t.auto_split_long = self.chk_auto_split.isChecked()
-        t.width_mode = self.combo_width_mode.currentData() or "visual"
+        t.width_mode = "strict" if t.language == "en" else (self.combo_width_mode.currentData() or "visual")
         t.min_duration_ms = self.spin_min_dur.value()
         t.max_duration_ms = max(t.min_duration_ms + 200, self.spin_max_dur.value())
         t.max_cps = self.spin_max_cps.value()

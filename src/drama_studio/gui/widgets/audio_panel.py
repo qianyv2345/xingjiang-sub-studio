@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 import numpy as np
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QUrl, Signal
+from PySide6.QtCore import QEasingCurve, QEventLoop, QPropertyAnimation, Qt, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import (
     QAudioFormat,
     QAudioOutput,
@@ -45,40 +45,46 @@ def _fmt_ms(ms: int) -> str:
 
 
 class _PcmScrubber:
-    """Low-latency audio grain scrubber via QtMultimedia push QAudioSink (no open file handles)."""
+    """Low-latency audio grain scrubber via QtMultimedia push QAudioSink (header-only cache, no WASAPI lock)."""
 
     def __init__(self, parent: QWidget) -> None:
         self._parent = parent
-        self._pcm_cache: dict[str, tuple[np.ndarray, int]] = {}
+        self._pcm_cache: dict[str, tuple[int, int, int]] = {}  # path -> (sr, channels, frames)
         self._active_path: str = ""
         self._sink: QAudioSink | None = None
         self._io = None
         self._sink_fmt: QAudioFormat | None = None
         self._last_scrub_ts: float = 0.0
         self._last_ms: int = -1000
+        self._idle_timer = QTimer(parent)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.setInterval(180)
+        self._idle_timer.timeout.connect(self.stop)
 
     def load_file(self, path: str) -> None:
         self._active_path = path
         if not path or path in self._pcm_cache or not Path(path).is_file():
             return
         try:
-            data, sr = sf.read(path, dtype="float32", always_2d=True)
-            self._pcm_cache[path] = (data, int(sr))
+            info = sf.info(path)
+            self._pcm_cache[path] = (int(info.samplerate), int(info.channels), int(info.frames))
         except Exception:
             pass
 
     def invalidate_cache(self) -> None:
+        self._idle_timer.stop()
         self.stop()
         self._pcm_cache.clear()
         self._active_path = ""
 
     def stop(self) -> None:
+        self._idle_timer.stop()
+        self._io = None
         if self._sink is not None:
             try:
                 self._sink.stop()
             except Exception:
                 pass
-        self._io = None
 
     def _ensure_sink(self, src_sr: int, src_ch: int) -> bool:
         app = QApplication.instance()
@@ -114,7 +120,7 @@ class _PcmScrubber:
         if not active_path:
             return
         now = time.monotonic()
-        if now - self._last_scrub_ts < 0.048 and abs(ms - self._last_ms) < 40:
+        if now - self._last_scrub_ts < 0.055 and abs(ms - self._last_ms) < 40:
             return
         self._last_scrub_ts = now
         self._last_ms = ms
@@ -124,17 +130,24 @@ class _PcmScrubber:
         entry = self._pcm_cache.get(active_path)
         if entry is None:
             return
-        pcm, sr = entry
-        if pcm.shape[0] == 0:
+        sr, channels, total_frames = entry
+        if total_frames <= 0 or sr <= 0:
             return
 
-        if not self._ensure_sink(sr, pcm.shape[1]) or self._sink is None or self._io is None or self._sink_fmt is None:
+        if not self._ensure_sink(sr, channels) or self._sink is None or self._io is None or self._sink_fmt is None:
             return
 
         grain_len = max(1, int(sr * 0.072))
-        start = max(0, min(pcm.shape[0] - 1, int(round(ms * sr / 1000.0))))
-        end = min(pcm.shape[0], start + grain_len)
-        seg = pcm[start:end].copy()
+        start = max(0, min(total_frames - 1, int(round(ms * sr / 1000.0))))
+        to_read = min(grain_len, total_frames - start)
+        if to_read < 8:
+            return
+        try:
+            with sf.SoundFile(active_path) as sf_fh:
+                sf_fh.seek(start)
+                seg = sf_fh.read(to_read, dtype="float32", always_2d=True)
+        except Exception:
+            return
         if seg.shape[0] < 8:
             return
 
@@ -167,14 +180,11 @@ class _PcmScrubber:
         else:
             raw_bytes = (np.clip(seg, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
-        # Keep buffer super snappy by capping backlog
+        # Never reset/restart WASAPI sink mid-drag; skip frame if audio device buffer is still busy
         free = self._sink.bytesFree()
-        if free < len(raw_bytes) // 2:
-            self._sink.reset()
-            self._io = self._sink.start()
-            free = self._sink.bytesFree()
-        if self._io is not None and free > 0:
+        if free >= max(64, len(raw_bytes) // 3) and self._io is not None:
             self._io.write(raw_bytes[:free])
+        self._idle_timer.start()
 
 
 class AudioPanel(QWidget):
@@ -266,7 +276,8 @@ class AudioPanel(QWidget):
 
         mode_track = AnimatedSegmentTrack()
         self.btn_light = QPushButton("轻度")
-        self.btn_std = QPushButton("标准 · 推荐")
+        self.btn_std = QPushButton("标准")
+        self.btn_std.setToolTip("标准人声均衡（推荐）")
         self.btn_strong = QPushButton("强力")
         self.mode_group = QButtonGroup(self)
         self.mode_group.setExclusive(True)
@@ -282,8 +293,16 @@ class AudioPanel(QWidget):
         self.btn_strong.clicked.connect(lambda: self._apply_preset("strong"))
 
         self.btn_adv_toggle = QPushButton("高级参数 ▾")
+        self.btn_adv_toggle.setObjectName("TogglePill")
         self.btn_adv_toggle.setCheckable(True)
         self.btn_adv_toggle.toggled.connect(self._toggle_advanced)
+
+        self.btn_kpi_toggle = QPushButton("响度仪表 ▴")
+        self.btn_kpi_toggle.setObjectName("TogglePill")
+        self.btn_kpi_toggle.setCheckable(True)
+        self.btn_kpi_toggle.setChecked(True)
+        self.btn_kpi_toggle.setToolTip("折叠或展开下方的 4 项人声响度统计卡片")
+        self.btn_kpi_toggle.toggled.connect(self._toggle_kpi_cards)
 
         self.btn_relevel = QPushButton("重新应用均衡曲线")
         self.btn_relevel.setObjectName("SuccessButton")
@@ -291,6 +310,7 @@ class AudioPanel(QWidget):
 
         mode_row.addWidget(mode_track)
         mode_row.addWidget(self.btn_adv_toggle)
+        mode_row.addWidget(self.btn_kpi_toggle)
         mode_row.addStretch()
         mode_row.addWidget(self.btn_relevel)
         top_card.body().addLayout(mode_row)
@@ -366,16 +386,23 @@ class AudioPanel(QWidget):
 
         lay.addWidget(top_card)
 
-        # --- Row 2: 4 KPI Glass Cards (Aurora Dashboard Style) ---
-        kpi_row = QHBoxLayout()
-        kpi_row.setSpacing(8)
+        # --- Row 2: Collapsible 4 KPI Glass Cards (Aurora Dashboard Style) ---
+        self.kpi_container = QWidget()
+        self.kpi_container.setObjectName("TransparentContainer")
+        kpi_row = QHBoxLayout(self.kpi_container)
+        kpi_row.setContentsMargins(0, 0, 0, 0)
+        kpi_row.setSpacing(6)
         self.kpi_before = KpiCard("原片综合响度", "-", "短时区间 -")
         self.kpi_after = KpiCard("均衡后响度", "-", "目标 -16 LUFS", accent=True)
         self.kpi_lra = KpiCard("动态范围 LRA", "-", "语音占比 -")
         self.kpi_peak = KpiCard("真峰值 True Peak", "-", "增益范围 -")
         for k in (self.kpi_before, self.kpi_after, self.kpi_lra, self.kpi_peak):
             kpi_row.addWidget(k, 1)
-        lay.addLayout(kpi_row)
+        lay.addWidget(self.kpi_container)
+
+    def _toggle_kpi_cards(self, checked: bool) -> None:
+        self.btn_kpi_toggle.setText("响度仪表 ▴" if checked else "响度仪表 ▾")
+        self.kpi_container.setVisible(checked)
 
     def _toggle_advanced(self, checked: bool) -> None:
         self.btn_adv_toggle.setText("高级参数 ▴" if checked else "高级参数 ▾")
@@ -484,6 +511,8 @@ class AudioPanel(QWidget):
         if target:
             self.player.setSource(QUrl.fromLocalFile(target))
             self._scrubber.load_file(target)
+        else:
+            self.player.setSource(QUrl())
 
     def switch_ab(self, channel: str) -> None:
         if channel == self._active_channel:
@@ -540,6 +569,9 @@ class AudioPanel(QWidget):
         self.player.stop()
         self.player.setSource(QUrl())
         self.btn_play.setText("▶ 试听")
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def seek_to_ms(self, ms: int) -> None:
         clamped = max(0, min(self._duration_ms, ms) if self._duration_ms > 0 else ms)

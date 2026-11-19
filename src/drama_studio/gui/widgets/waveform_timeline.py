@@ -34,6 +34,7 @@ class TimelineCanvas(QWidget):
 
     playheadSeeked = Signal(int)
     playheadScrubbed = Signal(int)
+    playheadScrubEnded = Signal()
     cueSelected = Signal(int)
     cuesEdited = Signal(str, list, list)
     manualPointsEdited = Signal(str, list, list)
@@ -509,6 +510,7 @@ class TimelineCanvas(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._drag_mode == "playhead":
+            self.playheadScrubEnded.emit()
             self.playheadSeeked.emit(self.playhead_ms)
         elif self._drag_mode in {"cue_left", "cue_right"}:
             self.cuesEdited.emit("调整字幕时间轴", self._drag_before_cues, deepcopy(self.cues))

@@ -384,7 +384,7 @@ QLabel#HardwareBanner {
     color: %(banner_text)s;
 }
 
-QPushButton {
+QPushButton, QToolButton {
     background-color: %(glass_surface)s;
     color: %(text)s;
     border: 1px solid %(glass_border)s;
@@ -393,20 +393,43 @@ QPushButton {
     font-weight: 600;
 }
 
-QPushButton:hover {
+QPushButton:hover, QToolButton:hover {
     background-color: %(selection)s;
     border-color: %(accent)s;
     color: %(text)s;
 }
 
-QPushButton:pressed {
+QPushButton:pressed, QToolButton:pressed {
     background-color: %(track_bg)s;
 }
 
-QPushButton:disabled {
+QPushButton:disabled, QToolButton:disabled {
     background-color: %(glass_surface_alt)s;
     color: %(muted)s;
     border-color: %(line)s;
+}
+
+QToolButton::menu-indicator {
+    image: none;
+    width: 0px;
+}
+
+QMenu {
+    background-color: %(surface)s;
+    color: %(text)s;
+    border: 1px solid %(line)s;
+    border-radius: 10px;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 6px 14px;
+    border-radius: 6px;
+}
+
+QMenu::item:selected {
+    background-color: %(selection)s;
+    color: %(accent)s;
 }
 
 QPushButton#PrimaryButton {
@@ -466,6 +489,40 @@ QPushButton#DangerButton:disabled {
     background-color: %(surface_alt)s;
     color: %(muted)s;
     border-color: %(line)s;
+}
+
+QPushButton#TogglePill {
+    background-color: %(surface_alt)s;
+    color: %(muted)s;
+    border: 1px solid %(glass_border)s;
+    border-radius: 8px;
+    padding: 4px 10px;
+    font-weight: 600;
+}
+
+QPushButton#TogglePill:checked {
+    background-color: %(badge_bg)s;
+    color: %(accent)s;
+    border: 1px solid %(accent)s;
+    font-weight: 700;
+}
+
+QGroupBox {
+    background-color: %(glass_surface)s;
+    border: 1px solid %(glass_border)s;
+    border-radius: 10px;
+    margin-top: 12px;
+    padding: 14px 12px 10px 12px;
+    font-weight: 700;
+    color: %(text)s;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 6px;
+    color: %(accent)s;
 }
 
 QFrame#SegmentTrack {

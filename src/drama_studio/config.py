@@ -41,6 +41,13 @@ def default_model_cache_dir(base_dir: Path | None = None) -> Path:
     return cache
 
 
+def default_work_cache_dir(base_dir: Path | None = None) -> Path:
+    root = base_dir or default_app_data_dir()
+    cache = root / "stage_cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
 class ConfigStore:
     """Loads and saves templates, per-project settings, and global preferences."""
 
@@ -56,6 +63,8 @@ class ConfigStore:
         self.active_project_id: str = "default"
         self.preferences: dict[str, Any] = {
             "model_cache_dir": str(default_model_cache_dir(self.base_dir)),
+            "work_cache_dir": str(default_work_cache_dir(self.base_dir)),
+            "cache_max_size_mb": 4096,
             "default_output_dir": "",
             "last_import_dir": "",
             "window_geometry": None,
@@ -73,6 +82,8 @@ class ConfigStore:
         builtins = [
             SubtitleTemplate.preset_portrait_9_16(),
             SubtitleTemplate.preset_landscape_16_9(),
+            SubtitleTemplate.preset_english_default(),
+            SubtitleTemplate.preset_english_portrait(),
         ]
         custom: list[SubtitleTemplate] = []
         if self.templates_path.exists():
@@ -193,6 +204,7 @@ class ConfigStore:
             except Exception:
                 pass
         Path(self.preferences["model_cache_dir"]).mkdir(parents=True, exist_ok=True)
+        Path(self.preferences["work_cache_dir"]).mkdir(parents=True, exist_ok=True)
 
     def save_prefs(self) -> None:
         self.prefs_path.write_text(

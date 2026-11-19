@@ -1,11 +1,4 @@
-"""台词文稿解析与 SRT 说话轮次 / 专有名词提取工具。
-
-支持用户提供的 `.md` / `.txt` 台词提取文稿，例如每场开头的出场人物行（`宋砚舟、顾恒、温云霄、顾玉冗、侍卫若干`）
-以及按说话轮次分段的台词正文。解析结果用于：
-1. 向中文分词器注入角色人名，避免剧名/人名被拆断；
-2. 标记不同说话人/段落轮次边界（`turn_id`），防止两人对话被合并进同一条字幕；
-3. 提供脚本内的停顿标点位置参考（绝不改写原 SRT spoken 台词）。
-"""
+"""台词/剧本文稿解析与说话轮次提取工具（支持中文短剧、英文剧本及双语混合格式）。"""
 
 from __future__ import annotations
 
@@ -18,20 +11,40 @@ from drama_studio.nlp.punctuation import (
     ALL_PUNCT_CHARS,
     SECONDARY_PUNCT,
     STRONG_PUNCT,
+    detect_text_language,
     is_protected_punct,
     normalize_ellipsis_and_dashes,
 )
 
-
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,6}\s+")
 _SCENE_HEADER_RE = re.compile(
-    r"^\s*(?:第[0-9一二三四五六七八九十百千万]+(?:集|场|幕)|场景|人物|演员表|出场人物|角色表|备注|说明)[:：\s].*$"
+    r"^\s*(?:"
+    r"第[0-9一二三四五六七八九十百千万]+(?:集|场|幕|章)"
+    r"|(?:场景|时间|地点|人物|演员表|出场人物|角色表|备注|说明|镜头|画面|景别|转场|音效|配乐|动作|提示)[:：\s]"
+    r"|(?:INT\.|EXT\.|INT\./EXT\.|I/E\.)\s*"
+    r"|(?:SCENE|ACT|SHOT|CAMERA|SFX|BGM|ACTION|NOTE|DIRECTION)\b[:：\s\-]*"
+    r"|(?:FADE\s+IN|FADE\s+OUT|CUT\s+TO|DISSOLVE\s+TO|SMASH\s+CUT|MATCH\s+CUT)[:：.\s]*$"
+    r")",
+    re.IGNORECASE,
 )
-_BRACKET_NOTE_RE = re.compile(r"^\s*[（(\[【][^（）\[\]【】]{1,24}[）)\]】]\s*$")
-_SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:【([^】]{1,8})】|([^\s：:，。？！、；]{1,6})[：:])\s*(.+)$")
+_EXPLICIT_DIRECTION_LINE_RE = re.compile(r"^\s*(?:△|▲|※|//|-->|★|•\s*(?:镜头|动作|场景|音效))")
+_BRACKET_NOTE_RE = re.compile(r"^\s*[（(\[【][^（）\[\]【】]{1,120}[）)\]】]\s*$")
+_INLINE_STAGE_BRACKET_RE = re.compile(r"[（(\[【](?:动作|镜头|特写|画外音|旁白|停顿|笑|哭|sfx|beat|v\.o\.|o\.s\.|cont'd|whispering|shouting|pause|laughs|sighs)[^）)\]】]{0,40}[）)\]】]", re.IGNORECASE)
+_META_BRACKET_SPEAKER = {"旁白提示", "场景", "动作", "镜头", "音效", "配乐", "备注", "说明", "sfx", "action", "camera", "note"}
+
+_SPEAKER_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"【([^】]{1,16})】"
+    r"|([^\s：:，。？！、；,?!;]{1,16}(?:\s+[A-Za-z0-9.'\-]{1,12}){0,2}(?:\s*\([^)]{1,16}\))?)\s*[：:]"
+    r")\s*(.+)$"
+)
+_BLOCK_SPEAKER_EN_RE = re.compile(
+    r"^\s*([A-Z][A-Z0-9 .'\-#]{1,28})(?:\s*\((?:V\.O\.|O\.S\.|CONT'D|O\.C\.|PRE-LAP|FILTERED)\))?\s*$"
+)
 _SPLIT_DELIM_RE = re.compile(r"[、,，\s]+")
 _TRAILING_QUANTIFIER_RE = re.compile(r"(?:若干|等人|等众|等)$")
 _SENTENCE_PUNCT_SET = STRONG_PUNCT | SECONDARY_PUNCT | {"…", "—"}
+_STOP_SPEAKER_WORDS = {"I", "NO", "YES", "OH", "OK", "OKAY", "WAIT", "STOP", "HELP", "WHAT", "WHY", "HEY", "HI", "BYE"}
 
 
 @dataclass
@@ -43,6 +56,7 @@ class ScriptTurn:
     spoken_text: str
     speaker: str = ""
     char_punct_after: list[str] = field(default_factory=list)
+    language: str = "zh"
 
 
 @dataclass
@@ -52,6 +66,7 @@ class ScriptDocument:
     path: str
     characters: list[str] = field(default_factory=list)
     turns: list[ScriptTurn] = field(default_factory=list)
+    language: str = "zh"
 
 
 @dataclass
@@ -66,7 +81,7 @@ class ScriptAlignmentResult:
 
 
 def _extract_spoken_and_punct(text: str) -> tuple[str, list[str]]:
-    """提取台词连续正文字符以及每个字符后面紧跟的脚本标点（与 segmenter 的字符提取完全一致）。"""
+    """提取台词连续正文字符以及每个字符后面紧跟的脚本标点（与 segmenter 的字符提取一致）。"""
     normalized = normalize_ellipsis_and_dashes(text.replace("\n", " ").strip())
     spoken_chars: list[str] = []
     punct_after: list[str] = []
@@ -88,11 +103,7 @@ def _normalize_match_char(ch: str) -> str:
 
 
 def _looks_like_cast_header(line: str) -> list[str] | None:
-    """识别场次开头/切换时的出场人物清单（如 `顾玉冗、温云霄、崇义`）。
-
-    这类行通常由 `、`（或逗号/空格）分隔多个 2~4 字人名，不含句末/句中常见标点，
-    也不包含动词长句。命中时返回提取的人名列表，否则返回 None。
-    """
+    """识别场次开头/切换时的出场人物清单（如 `顾玉冗、温云霄、崇义`）。"""
     stripped = line.strip()
     if not stripped or "、" not in stripped:
         return None
@@ -101,13 +112,11 @@ def _looks_like_cast_header(line: str) -> list[str] | None:
     parts = [p.strip() for p in _SPLIT_DELIM_RE.split(stripped) if p.strip()]
     if len(parts) < 2:
         return None
-    # 每段应为短称呼（人名或角色标签），不能出现长句
     if any(len(p) > 6 for p in parts):
         return None
     names: list[str] = []
     for part in parts:
         cleaned = _TRAILING_QUANTIFIER_RE.sub("", part).strip()
-        # 仅保留看起来像专有名词/称谓的 2~4 字片段
         if 2 <= len(cleaned) <= 4 and all("\u4e00" <= c <= "\u9fff" for c in cleaned):
             if cleaned not in names:
                 names.append(cleaned)
@@ -118,7 +127,7 @@ def read_script_text(path: str | Path) -> str:
     """多编码容错读取台词稿文本。"""
     p = Path(path)
     raw = p.read_bytes()
-    for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "gb18030", "gbk"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
@@ -126,51 +135,109 @@ def read_script_text(path: str | Path) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
+def _clean_dialogue_line(text: str) -> str:
+    cleaned = _INLINE_STAGE_BRACKET_RE.sub(" ", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_non_dialogue_line(line: str) -> bool:
+    if not line or re.fullmatch(r"[-=*_~]{3,}", line):
+        return True
+    if _SCENE_HEADER_RE.match(line):
+        return True
+    if _EXPLICIT_DIRECTION_LINE_RE.match(line):
+        return True
+    if _BRACKET_NOTE_RE.match(line):
+        return True
+    return False
+
+
 def parse_dialogue_script(path: str | Path) -> ScriptDocument:
-    """解析 `.md` / `.txt` 台词文稿，提取出场人名列表和发言轮次。"""
+    """解析 `.md` / `.txt` 台词文稿（中/英文），提取出场人名与纯净对白轮次。"""
     text = read_script_text(path)
     characters: list[str] = []
     turns: list[ScriptTurn] = []
 
     def _add_char_name(name: str) -> None:
-        if 2 <= len(name) <= 5 and name not in characters:
-            characters.append(name)
+        clean = re.sub(r"\s*\([^)]*\)$", "", name).strip()
+        if 2 <= len(clean) <= 24 and clean not in characters:
+            characters.append(clean)
 
-    for raw_line in text.splitlines():
+    raw_lines = text.splitlines()
+    n_lines = len(raw_lines)
+    pending_speaker = ""
+
+    idx = 0
+    while idx < n_lines:
+        raw_line = raw_lines[idx]
         line = _MARKDOWN_HEADING_RE.sub("", raw_line).strip()
+        idx += 1
+
         if not line:
+            pending_speaker = ""
             continue
-        if _SCENE_HEADER_RE.match(line):
-            continue
-        if _BRACKET_NOTE_RE.match(line):
+        if _is_non_dialogue_line(line):
             continue
 
         cast_names = _looks_like_cast_header(line)
         if cast_names is not None:
             for name in cast_names:
                 _add_char_name(name)
+            pending_speaker = ""
             continue
 
-        speaker = ""
+        # Check standalone screenplay speaker block (e.g. "DR. SMITH" / "ALEX (V.O.)" on its own line)
+        blk_m = _BLOCK_SPEAKER_EN_RE.match(line)
+        if blk_m and blk_m.group(1).strip() not in _STOP_SPEAKER_WORDS:
+            # Confirm next non-empty, non-bracket line looks like dialogue
+            look = idx
+            has_following_dialogue = False
+            while look < n_lines:
+                nxt = raw_lines[look].strip()
+                if not nxt:
+                    break
+                if _BRACKET_NOTE_RE.match(nxt):
+                    look += 1
+                    continue
+                if not _is_non_dialogue_line(nxt):
+                    has_following_dialogue = True
+                break
+            if has_following_dialogue:
+                cand = blk_m.group(1).strip().title() if blk_m.group(1).isupper() and len(blk_m.group(1)) > 3 else blk_m.group(1).strip()
+                pending_speaker = cand
+                _add_char_name(cand)
+                continue
+
+        speaker = pending_speaker
         dialogue = line
         speaker_match = _SPEAKER_PREFIX_RE.match(line)
         if speaker_match:
             candidate_speaker = (speaker_match.group(1) or speaker_match.group(2) or "").strip()
+            candidate_clean = re.sub(r"\s*\([^)]*\)$", "", candidate_speaker).strip()
             rest = (speaker_match.group(3) or "").strip()
-            # 确认不是剧内正常对话（比如“你说：……”通常不会当作角色前缀）
+            if candidate_clean.lower() in _META_BRACKET_SPEAKER:
+                continue
             if (
-                candidate_speaker
+                candidate_clean
                 and rest
-                and not any(pron in candidate_speaker for pron in ("我", "你", "他", "她", "它", "谁"))
+                and not any(pron in candidate_clean for pron in ("我", "你", "他", "她", "它", "谁"))
+                and not re.match(r"^\d{1,2}$", candidate_clean)  # avoid timestamp-like "12:30"
             ):
-                speaker = candidate_speaker
+                speaker = candidate_clean
                 dialogue = rest
-                _add_char_name(candidate_speaker)
+                _add_char_name(candidate_clean)
+                pending_speaker = ""
+
+        dialogue = _clean_dialogue_line(dialogue)
+        if not dialogue:
+            continue
 
         spoken_text, char_punct_after = _extract_spoken_and_punct(dialogue)
         if not spoken_text:
             continue
 
+        turn_lang = detect_text_language(dialogue)
         turns.append(
             ScriptTurn(
                 turn_id=len(turns),
@@ -178,13 +245,16 @@ def parse_dialogue_script(path: str | Path) -> ScriptDocument:
                 spoken_text=spoken_text,
                 speaker=speaker,
                 char_punct_after=char_punct_after,
+                language=turn_lang,
             )
         )
 
+    doc_lang = detect_text_language(" ".join(t.raw_line for t in turns))
     return ScriptDocument(
         path=str(path),
         characters=characters,
         turns=turns,
+        language=doc_lang,
     )
 
 
@@ -193,11 +263,7 @@ def align_script_turns_to_cues(
     script_doc: ScriptDocument,
     min_match_ratio: float = 0.55,
 ) -> ScriptAlignmentResult:
-    """将台词文稿中的说话轮次（`turn_id`）对齐回原始 SRT 每条字幕的每个 spoken 字符。
-
-    采用 SRT 字符覆盖率而非整篇文稿比值，兼容单场分镜切片（例如 125-03-01）
-    匹配整集台词稿（第125集.md）；绝不修改 SRT 原文字。
-    """
+    """将台词文稿中的说话轮次（`turn_id`）对齐回原始 SRT 每条字幕的每个 spoken 字符。"""
     cue_spoken_lengths: list[int] = []
     srt_spoken: list[str] = []
     srt_cue_index: list[int] = []
@@ -261,13 +327,11 @@ def align_script_turns_to_cues(
                 if mapped_j == j2 - 1 or offset == i2 - i1 - 1:
                     srt_punct_after[i1 + offset] = script_char_punct[mapped_j]
 
-    # 对 'delete'（SRT 中多余的语气词或未收录短句）按同一 cue 内相邻匹配填补，确保单调不减
     last_turn = 0
     for i in range(len(srt_turn_ids)):
         if srt_turn_ids[i] >= 0:
             last_turn = srt_turn_ids[i]
             continue
-        # 若后续同 cue 内就有明确 turn_id，则优先就近对齐
         assigned = last_turn
         for lookahead in range(i + 1, min(len(srt_turn_ids), i + 8)):
             if srt_cue_index[lookahead] != srt_cue_index[i]:

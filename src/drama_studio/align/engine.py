@@ -13,6 +13,7 @@ import numpy as np
 from drama_studio.align.base import UtteranceWindow
 from drama_studio.align.funasr_aligner import FunASRAlignerBackend
 from drama_studio.align.qwen_aligner import Qwen3AlignerBackend
+from drama_studio.align.runtime import MODEL_POOL
 from drama_studio.models import (
     AlignmentConfig,
     AnomalyItem,
@@ -24,6 +25,8 @@ from drama_studio.models import (
 )
 from drama_studio.nlp.punctuation import (
     STRONG_PUNCT,
+    count_english_words,
+    detect_text_language,
     extract_canonical_spoken_sequence,
     strip_display_punctuation,
 )
@@ -44,6 +47,42 @@ from drama_studio.nlp.segmenter import (
     width_fits_limit,
 )
 from drama_studio.nlp.srt_io import normalize_cues_for_resolve
+
+
+class MissingAlignerModelError(RuntimeError):
+    """Raised when acoustic forced alignment has no local aligner model available and fallback is disabled."""
+
+    def __init__(self, recommended_model_id: str, message: str) -> None:
+        super().__init__(message)
+        self.recommended_model_id = recommended_model_id
+
+
+@dataclass
+class AlignedUtteranceData:
+    """Intermediate forced-aligned utterance window before template-driven DP segmentation."""
+
+    clean_text: str
+    window_start_ms: int
+    window_end_ms: int
+    char_timings: list[CharTimestamp]
+    win_char_turns: list[int]
+    win_char_hints: list[str]
+    per_cue_turn: list[int]
+    cues_snapshot: list[SubtitleCue]
+    max_local_turn: int
+
+
+@dataclass
+class ForcedAlignmentStageResult:
+    """Cacheable output of Stage 3A (forced alignment + acoustic refinement)."""
+
+    aligned_windows: list[AlignedUtteranceData]
+    global_offset_ms: int
+    aligner_used: str
+    effective_language: str
+    extra_phrases: list[str]
+    pre_warnings: list[AnomalyItem]
+    script_mismatch_ratio: float | None = None
 
 
 @dataclass
@@ -209,6 +248,15 @@ def _group_cues_into_windows(
         cur_s, cur_e, cur_cue = item
         gap = cur_s - prev_e
         span_dur = cur_e - cur[0][0]
+        same_asr_win = (
+            prev_cue.src_win_start_ms >= 0
+            and prev_cue.src_win_start_ms == cur_cue.src_win_start_ms
+            and prev_cue.src_win_end_ms == cur_cue.src_win_end_ms
+        )
+        if same_asr_win and (max(cur_e, cur_cue.src_win_end_ms) - min(cur[0][0], cur[0][2].src_win_start_ms)) <= max_window_ms:
+            cur.append(item)
+            continue
+
         prev_txt = prev_cue.raw_text.strip()
         prev_strong_end = bool(prev_txt) and prev_txt[-1] in STRONG_PUNCT
         # Check whether a real VAD silence gap separates prev_cue and cur_cue around boundary
@@ -225,6 +273,15 @@ def _group_cues_into_windows(
     for g_idx, grp in enumerate(groups):
         raw_s = grp[0][0]
         raw_e = grp[-1][1]
+        src_starts = [it[2].src_win_start_ms for it in grp if it[2].src_win_start_ms >= 0]
+        src_ends = [it[2].src_win_end_ms for it in grp if it[2].src_win_end_ms >= 0]
+        has_src_win = bool(src_starts and src_ends)
+        if has_src_win:
+            cand_s = min(raw_s, min(src_starts))
+            cand_e = max(raw_e, max(src_ends))
+            if (cand_e - cand_s) <= max_window_ms:
+                raw_s, raw_e = cand_s, cand_e
+
         # Prefer silent VAD valley midpoints over noisy raw SRT midpoints so speech onsets are never clipped
         if g_idx == 0:
             prev_limit = 0
@@ -240,9 +297,14 @@ def _group_cues_into_windows(
             valley_next = _find_nearest_vad_valley(approx_next, vad_spans, min_gap_ms=140, max_dist_ms=1200)
             next_limit = valley_next if valley_next is not None else approx_next
 
+        # Keep true ASR window boundaries intact when groups are derived from Stage 2 VAD-bounded windows
+        if has_src_win:
+            prev_limit = min(prev_limit, raw_s)
+            next_limit = max(next_limit, raw_e)
+
         # Detect per-shot local drift when ASR anchor is unavailable and current group misses speech VAD
         local_shift = 0
-        if vad_spans and not any(cue_pos_map.get(id(it[2]), -1) in anchored_bounds for it in grp):
+        if vad_spans and not has_src_win and not any(cue_pos_map.get(id(it[2]), -1) in anchored_bounds for it in grp):
             grp_dur = max(1, raw_e - raw_s)
             base_ov = _vad_overlap_ratio(raw_s, raw_e, vad_spans)
             if base_ov < 0.55 and grp_dur < 10000:
@@ -259,8 +321,9 @@ def _group_cues_into_windows(
                 if not (best_ov >= 0.70 and best_ov > max(0.25, base_ov) * 1.35):
                     local_shift = 0
 
-        win_s = max(prev_limit, raw_s + local_shift - 1250)
-        win_e = min(next_limit, raw_e + local_shift + 1250)
+        margin_ms = 260 if has_src_win else 1250
+        win_s = max(prev_limit, raw_s + local_shift - margin_ms)
+        win_e = min(next_limit, raw_e + local_shift + margin_ms)
 
         # Snap outward slightly if a VAD span starts/ends right inside search margin
         for vs, ve in vad_spans:
@@ -378,6 +441,87 @@ def _apply_spacing_and_bridge(
     )
 
 
+def _apply_non_invading_padding(
+    cues: list[SubtitleCue],
+    raw_bounds: list[tuple[int, int]],
+    template: SubtitleTemplate,
+    duration_ms: int,
+    *,
+    video_fps: float = 25.0,
+    pad_mask: list[bool] | None = None,
+) -> list[SubtitleCue]:
+    """Expand head/tail breathing room only into real surrounding silence, never invading adjacent speech."""
+    if not cues:
+        return []
+    n = len(cues)
+    mask = pad_mask if (pad_mask is not None and len(pad_mask) == n) else [True] * n
+    lead_ms, tail_ms = template.resolve_padding_ms(video_fps)
+    end_cap = duration_ms if duration_ms > 0 else 10**9
+    min_keep = min(80, template.min_duration_ms)
+
+    starts = [max(0, int(rs)) for rs, _ in raw_bounds]
+    ends = [max(max(0, int(rs)) + 1, int(re)) for rs, re in raw_bounds]
+
+    if mask[0]:
+        starts[0] = max(0, starts[0] - lead_ms)
+    if mask[-1]:
+        bounded_last = max(starts[-1] + 40, ends[-1] + tail_ms)
+        ends[-1] = min(end_cap, bounded_last)
+
+    want_tail = max(0, tail_ms)
+    want_lead = max(0, lead_ms)
+    shrink_tail = tail_ms if tail_ms < 0 else 0
+    shrink_lead = lead_ms if lead_ms < 0 else 0
+
+    for idx in range(n - 1):
+        prev = cues[idx]
+        nxt = cues[idx + 1]
+        prev_re = raw_bounds[idx][1]
+        nxt_rs = raw_bounds[idx + 1][0]
+
+        prev_eff_shrink = shrink_tail if mask[idx] else 0
+        nxt_eff_shrink = shrink_lead if mask[idx + 1] else 0
+        eff_tail_base = prev_re + prev_eff_shrink
+        eff_lead_base = nxt_rs - nxt_eff_shrink
+        eff_gap = eff_lead_base - eff_tail_base
+
+        prev_stripped = prev.raw_text.strip()
+        prev_strong_end = bool(prev_stripped) and prev_stripped[-1] in STRONG_PUNCT
+        same_turn = (prev.turn_id == nxt.turn_id) and not prev_strong_end
+        will_bridge = (
+            template.bridge_sentence_gaps
+            and same_turn
+            and 0 <= eff_gap <= template.bridge_max_gap_ms
+        )
+        req_gap = 1 if will_bridge else max(1, template.min_gap_ms)
+        usable = max(0, eff_gap - req_gap)
+
+        prev_want = want_tail if mask[idx] else 0
+        nxt_want = want_lead if mask[idx + 1] else 0
+        total_want = prev_want + nxt_want
+        if total_want <= 0 or usable == 0:
+            tail_add = 0
+            lead_sub = 0
+        elif usable >= total_want:
+            tail_add = prev_want
+            lead_sub = nxt_want
+        else:
+            # Share tight silence pauses proportionally without crossing the neighbor's spoken word edge
+            tail_add = int(round(usable * (prev_want / total_want)))
+            lead_sub = min(nxt_want, usable - tail_add)
+
+        if mask[idx]:
+            ends[idx] = min(end_cap, max(raw_bounds[idx][0] + 40, eff_tail_base + tail_add))
+        if mask[idx + 1]:
+            starts[idx + 1] = max(0, eff_lead_base - lead_sub)
+
+    for cue, s_ms, e_ms in zip(cues, starts, ends):
+        cue.start_ms = s_ms
+        cue.end_ms = max(s_ms + min_keep, e_ms)
+
+    return _apply_spacing_and_bridge(cues, template, duration_ms)
+
+
 def _apply_padding_and_merge(
     cues: list[SubtitleCue],
     template: SubtitleTemplate,
@@ -390,6 +534,7 @@ def _apply_padding_and_merge(
         return []
 
     # Optional short-cue auto-merging before padding (never merge across turn boundaries)
+    eff_width_mode = "strict" if template.language == "en" else template.width_mode
     merged: list[SubtitleCue] = []
     if template.auto_merge_short:
         for cue in cues:
@@ -398,10 +543,11 @@ def _apply_padding_and_merge(
                 prev_raw_stripped = prev.raw_text.strip()
                 ends_with_strong_punct = bool(prev_raw_stripped) and prev_raw_stripped[-1] in STRONG_PUNCT
                 gap = cue.start_ms - prev.end_ms
-                prev_w = measure_text_width(prev.effective_text, template.width_mode)
-                cur_w = measure_text_width(cue.effective_text, template.width_mode)
-                comb_flat = prev.effective_text.replace("\n", "") + cue.effective_text.replace("\n", "")
-                comb_w = measure_text_width(comb_flat, template.width_mode)
+                prev_w = measure_text_width(prev.effective_text, eff_width_mode)
+                cur_w = measure_text_width(cue.effective_text, eff_width_mode)
+                joiner = " " if template.language == "en" else ""
+                comb_flat = (prev.effective_text.replace("\n", " ").strip() + joiner + cue.effective_text.replace("\n", " ").strip()).strip()
+                comb_w = measure_text_width(comb_flat, eff_width_mode)
                 if (
                     prev.turn_id == cue.turn_id
                     and not ends_with_strong_punct
@@ -411,7 +557,7 @@ def _apply_padding_and_merge(
                     and width_fits_limit(comb_w, template.max_chars_per_line * template.max_lines)
                 ):
                     new_text, fits = format_single_cue_without_split(
-                        prev.raw_text + " " + cue.raw_text,
+                        prev.raw_text.strip() + " " + cue.raw_text.strip(),
                         template,
                     )
                     if fits:
@@ -426,14 +572,9 @@ def _apply_padding_and_merge(
     else:
         merged = cues
 
-    # Apply head/tail offset padding safely (converting frames -> ms via video_fps when in frame mode)
-    lead_ms, tail_ms = template.resolve_padding_ms(video_fps)
-    for cue in merged:
-        cue.start_ms = max(0, cue.start_ms - lead_ms)
-        padded_end = max(cue.start_ms + 80, cue.end_ms + tail_ms)
-        cue.end_ms = min(duration_ms, padded_end) if duration_ms > 0 else padded_end
-
-    return _apply_spacing_and_bridge(merged, template, duration_ms)
+    # Expand pre/post breathing room strictly into genuine silence (never invade continuous neighbor words)
+    raw_bounds = [(c.start_ms, c.end_ms) for c in merged]
+    return _apply_non_invading_padding(merged, raw_bounds, template, duration_ms, video_fps=video_fps)
 
 
 def run_quality_checks(
@@ -454,17 +595,40 @@ def run_quality_checks(
     else:
         noise_db = -70.0
 
+    eff_width_mode = "strict" if template.language == "en" else template.width_mode
     for idx, cue in enumerate(cues):
         cue.anomaly_flags.clear()
         text = cue.effective_text
         lines = cue.lines()
         dur = cue.duration_ms
-        max_w = measure_text_width(text, template.width_mode)
-        flat_chars = len(extract_canonical_spoken_sequence(text))
+        max_w = measure_text_width(text, eff_width_mode)
+        flat_chars = (
+            len(text.replace("\n", " ").strip())
+            if template.language == "en"
+            else len(extract_canonical_spoken_sequence(text))
+        )
         cps = flat_chars / max(0.1, dur / 1000.0)
 
         vad_ov = _vad_overlap_ratio(cue.start_ms, cue.end_ms, vad_spans)
         seg_rms = _segment_rms_db(audio_16k, cue.start_ms, cue.end_ms)
+
+        is_vad_estimated = bool(cue.char_timings) and (
+            sum(1 for ct in cue.char_timings if ct.interpolated) / len(cue.char_timings) >= 0.8
+        )
+        if is_vad_estimated:
+            est_msg = "VAD估算时间轴(未声学对齐)"
+            cue.anomaly_flags.append(est_msg)
+            anomalies.append(
+                AnomalyItem(
+                    anomaly_type=AnomalyType.LOW_CONFIDENCE,
+                    severity=AnomalySeverity.WARNING,
+                    start_ms=cue.start_ms,
+                    end_ms=cue.end_ms,
+                    cue_index=cue.index,
+                    message=f"{est_msg}：该字幕由语音区间按字数比例估算生成，非逐字声学强制对齐",
+                    suggestion="建议安装并启用 Qwen3-ForcedAligner-0.6B 或 FunASR fa-zh 后重新执行对齐。",
+                )
+            )
 
         if vad_ov < 0.08 and seg_rms < noise_db + 4.5:
             cue.confidence = min(cue.confidence, 0.30)
@@ -497,7 +661,8 @@ def run_quality_checks(
             )
 
         if not width_fits_limit(max_w, template.max_chars_per_line) or len(lines) > template.max_lines:
-            msg = f"超出模板排版限制（{max_w:.1f}/{template.max_chars_per_line}字，{len(lines)}/{template.max_lines}行）"
+            unit_lbl = "字符" if template.language == "en" else "字"
+            msg = f"超出模板排版限制（{max_w:.1f}/{template.max_chars_per_line}{unit_lbl}，{len(lines)}/{template.max_lines}行）"
             cue.anomaly_flags.append(msg)
             anomalies.append(
                 AnomalyItem(
@@ -510,6 +675,26 @@ def run_quality_checks(
                     suggestion="可调大每行字数、切换2行模式或点击拆分该条字幕。",
                 )
             )
+        elif template.language == "en" and len(lines) == 2:
+            wc1 = count_english_words(lines[0])
+            wc2 = count_english_words(lines[1])
+            if wc1 < template.min_words_line1 or wc2 < template.min_words_line2:
+                msg = (
+                    f"英文双行单词数不满足模板要求（第1行 {wc1}/{template.min_words_line1} 词，"
+                    f"第2行 {wc2}/{template.min_words_line2} 词）"
+                )
+                cue.anomaly_flags.append(msg)
+                anomalies.append(
+                    AnomalyItem(
+                        anomaly_type=AnomalyType.LAYOUT_WARNING,
+                        severity=AnomalySeverity.WARNING,
+                        start_ms=cue.start_ms,
+                        end_ms=cue.end_ms,
+                        cue_index=cue.index,
+                        message=msg,
+                        suggestion="可调整字符限制或手动合并/调整换行。",
+                    )
+                )
 
         if dur < template.min_duration_ms:
             msg = f"显示时长过短 ({dur} ms < {template.min_duration_ms} ms)"
@@ -648,6 +833,49 @@ def _compute_window_turn_ids(
     return window_turns, window_hints, per_cue_turn
 
 
+def _tokens_to_char_timings(
+    sub_toks: list[UnitToken],
+    *,
+    interpolated: bool = False,
+) -> list[CharTimestamp]:
+    """Expand atomic UnitTokens back to per-character CharTimestamps so subsequent relayouts align 1-to-1."""
+    out: list[CharTimestamp] = []
+    for t in sub_toks:
+        txt = t.text
+        if len(txt) <= 1:
+            out.append(
+                CharTimestamp(
+                    char=txt,
+                    start_ms=t.start_ms,
+                    end_ms=t.end_ms,
+                    confidence=t.confidence,
+                    interpolated=interpolated,
+                )
+            )
+        else:
+            dur = max(len(txt) * 10, t.end_ms - t.start_ms)
+            step = dur / len(txt)
+            for k, ch in enumerate(txt):
+                cs = int(round(t.start_ms + k * step))
+                ce = t.end_ms if k == len(txt) - 1 else int(round(t.start_ms + (k + 1) * step))
+                out.append(
+                    CharTimestamp(
+                        char=ch,
+                        start_ms=cs,
+                        end_ms=max(cs + 10, ce),
+                        confidence=t.confidence,
+                        interpolated=interpolated,
+                    )
+                )
+    return out
+
+
+def _join_sub_tokens_raw(sub_toks: list[UnitToken], language: str) -> str:
+    if language == "en":
+        return " ".join(t.raw_with_punct.strip() for t in sub_toks if t.raw_with_punct.strip()).strip()
+    return "".join(t.raw_with_punct for t in sub_toks).strip()
+
+
 def relayout_cues_with_template(
     cues: list[SubtitleCue],
     template: SubtitleTemplate,
@@ -660,7 +888,8 @@ def relayout_cues_with_template(
 ) -> tuple[list[SubtitleCue], list[AnomalyItem], bool]:
     """Re-segment existing aligned cues dynamically when user changes slider or 1L/2L template."""
     out: list[SubtitleCue] = []
-    lead_ms, tail_ms = template.resolve_padding_ms(video_fps)
+    raw_bounds: list[tuple[int, int]] = []
+    pad_mask: list[bool] = []
     current_relayout_turn = -1
     prev_cue_turn: int | None = None
     prev_ended_strong = True
@@ -681,6 +910,7 @@ def relayout_cues_with_template(
                 fallback_start_ms=cue.start_ms,
                 fallback_end_ms=cue.end_ms,
                 nlp_backend=nlp_backend,  # type: ignore[arg-type]
+                language=template.language,
             )
             if tokens:
                 segs = segment_tokens_dp(tokens, template)
@@ -688,7 +918,7 @@ def relayout_cues_with_template(
                 for seg_idx, (s_i, e_i, disp, _) in enumerate(segs):
                     sub_toks = tokens[s_i:e_i]
                     local_turn = sub_toks[0].turn_id
-                    raw_sub = "".join(t.raw_with_punct for t in sub_toks).strip()
+                    raw_sub = _join_sub_tokens_raw(sub_toks, template.language)
                     seg_strong_end = bool(raw_sub) and raw_sub[-1] in STRONG_PUNCT
                     if seg_idx == 0:
                         assigned_turn = _next_turn_flag(cue.turn_id, seg_strong_end)
@@ -701,27 +931,11 @@ def relayout_cues_with_template(
                     prev_local_turn = local_turn
 
                     avg_conf = sum(t.confidence for t in sub_toks) / max(1, len(sub_toks))
-                    sub_chars = [
-                        CharTimestamp(
-                            char=t.text,
-                            start_ms=t.start_ms,
-                            end_ms=t.end_ms,
-                            confidence=t.confidence,
-                        )
-                        for t in sub_toks
-                    ]
-                    # Apply gentle breathing padding on newly created split edges, preserve outer cue padding
+                    sub_chars = _tokens_to_char_timings(sub_toks)
                     s_ms = sub_toks[0].start_ms
-                    e_ms = sub_toks[-1].end_ms
-                    if seg_idx == 0:
-                        s_ms = min(s_ms, cue.start_ms)
-                    else:
-                        s_ms = max(0, s_ms - lead_ms)
-                    if seg_idx == len(segs) - 1:
-                        e_ms = max(e_ms, cue.end_ms)
-                    else:
-                        padded_e = e_ms + tail_ms
-                        e_ms = min(duration_ms, padded_e) if duration_ms > 0 else padded_e
+                    e_ms = max(s_ms + 40, sub_toks[-1].end_ms)
+                    raw_bounds.append((s_ms, e_ms))
+                    pad_mask.append(True)
 
                     out.append(
                         SubtitleCue(
@@ -747,9 +961,24 @@ def relayout_cues_with_template(
         c_copy.index = len(out) + 1
         cue_strong_end = bool(cue.raw_text.strip()) and cue.raw_text.strip()[-1] in STRONG_PUNCT
         c_copy.turn_id = _next_turn_flag(cue.turn_id, cue_strong_end)
+        if c_copy.char_timings:
+            rs = max(0, int(c_copy.char_timings[0].start_ms))
+            re = max(rs + 40, int(c_copy.char_timings[-1].end_ms))
+            raw_bounds.append((rs, re))
+            pad_mask.append(True)
+        else:
+            raw_bounds.append((c_copy.start_ms, c_copy.end_ms))
+            pad_mask.append(False)
         out.append(c_copy)
 
-    final_cues = _apply_spacing_and_bridge(out, template, duration_ms)
+    final_cues = _apply_non_invading_padding(
+        out,
+        raw_bounds,
+        template,
+        duration_ms,
+        video_fps=video_fps,
+        pad_mask=pad_mask,
+    )
     ok, _ = verify_text_integrity(cues, final_cues)
     anomalies = run_quality_checks(final_cues, template, vad_spans, audio_16k, duration_ms)
     return final_cues, anomalies, ok
@@ -777,17 +1006,16 @@ def _refine_char_boundaries_with_acoustics(
     audio_16k: np.ndarray,
     duration_ms: int,
 ) -> None:
-    """Refine forced-aligner timestamps at 10ms RMS resolution to fix 80ms grid lag & silence smearing."""
+    """Refine forced-aligner timestamps at 10ms centered RMS resolution to fix 80ms grid lag & early tail cutoffs."""
     if not char_timings or len(audio_16k) < 640:
         return
 
-    sr = 16000
     hop_samples = 160  # 10ms step
-    win_samples = 320  # 20ms analysis window
-    n_frames = max(1, (len(audio_16k) - win_samples) // hop_samples + 1)
+    half_win = 160     # 20ms centered analysis window [t - 10ms, t + 10ms]
+    n_frames = max(1, len(audio_16k) // hop_samples)
     # Only compute RMS over active window slice for speed
-    w_s = max(0, char_timings[0].start_ms - 280)
-    w_e = min(duration_ms if duration_ms > 0 else len(audio_16k) // 16, char_timings[-1].end_ms + 280)
+    w_s = max(0, char_timings[0].start_ms - 360)
+    w_e = min(duration_ms if duration_ms > 0 else len(audio_16k) // 16, char_timings[-1].end_ms + 360)
     f_start = max(0, w_s // 10)
     f_end = min(n_frames, max(f_start + 5, w_e // 10 + 1))
     if f_end - f_start < 6:
@@ -795,8 +1023,8 @@ def _refine_char_boundaries_with_acoustics(
 
     rms_db = np.full(f_end - f_start, -90.0, dtype=np.float64)
     for fi in range(f_start, f_end):
-        s_smp = fi * hop_samples
-        seg = audio_16k[s_smp : min(len(audio_16k), s_smp + win_samples)]
+        c_smp = fi * hop_samples
+        seg = audio_16k[max(0, c_smp - half_win) : min(len(audio_16k), c_smp + half_win)]
         if len(seg) > 0:
             val = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
             rms_db[fi - f_start] = 20.0 * np.log10(max(1e-6, val))
@@ -807,9 +1035,10 @@ def _refine_char_boundaries_with_acoustics(
     if speech_db - noise_db < 10.0:
         return
     speech_thresh = max(noise_db + 7.5, speech_db - 26.0)
+    tail_thresh = max(speech_thresh, speech_db - 22.0)
 
     def _db_at(ms: int) -> float:
-        idx = (ms // 10) - f_start
+        idx = int(round(ms / 10.0)) - f_start
         if idx < 0:
             return float(rms_db[0])
         if idx >= len(rms_db):
@@ -820,21 +1049,43 @@ def _refine_char_boundaries_with_acoustics(
         prev_end = char_timings[i - 1].end_ms if i > 0 else 0
         next_start = char_timings[i + 1].start_ms if i + 1 < len(char_timings) else duration_ms
 
-        # 1. Advance ct.start_ms if aligner smeared preceding silence onto this character (e.g. '你': 1600..2160)
-        if ct.end_ms - ct.start_ms >= 180 and _db_at(ct.start_ms) < speech_thresh - 1.5:
+        # 1. Advance ct.start_ms if aligner placed start in leading silence (including 80-160ms first chars)
+        has_gap_before = (i == 0) or (ct.start_ms - prev_end >= 80)
+        mid_ct = (ct.start_ms + ct.end_ms) // 2
+        silent_start = (
+            _db_at(ct.start_ms) < speech_thresh - 1.5
+            or (
+                has_gap_before
+                and ct.end_ms - ct.start_ms >= 60
+                and _db_at(ct.start_ms) < speech_thresh
+                and _db_at(ct.start_ms + 10) < speech_thresh - 1.5
+            )
+        )
+        trimmed_lead = False
+        if (
+            ((has_gap_before or ct.end_ms - ct.start_ms >= 180) and silent_start)
+            or (len(char_timings) <= 3 and _db_at(mid_ct) < speech_thresh - 2.5)
+        ):
+            extra_fwd = 280 if len(char_timings) <= 3 else (80 if has_gap_before else -50)
+            scan_end = min(next_start - 20, ct.end_ms + extra_fwd)
             scan = ct.start_ms
             found_onset = None
-            while scan <= ct.end_ms - 50:
-                if _db_at(scan) >= speech_thresh:
+            while scan <= scan_end:
+                if _db_at(scan) >= speech_thresh and (
+                    scan + 10 > scan_end or _db_at(scan + 10) >= speech_thresh - 2.0
+                ):
                     found_onset = scan
                     break
                 scan += 10
-            if found_onset is not None and found_onset - ct.start_ms >= 50:
-                ct.start_ms = max(ct.start_ms, found_onset - 25)
+            if found_onset is not None and found_onset - ct.start_ms >= 20:
+                ct.start_ms = max(ct.start_ms, found_onset - 10)
+                trimmed_lead = True
+                if ct.end_ms <= ct.start_ms + 40:
+                    ct.end_ms = min(next_start, ct.start_ms + 100)
 
         # 2. Snap quantized onset back by up to 130ms if clear speech already started right before ct.start_ms
-        has_gap_before = (i == 0) or (ct.start_ms - prev_end >= 120)
-        if has_gap_before and _db_at(ct.start_ms) >= speech_thresh - 4.0:
+        has_gap_for_back = (i == 0) or (ct.start_ms - prev_end >= 120)
+        if not trimmed_lead and has_gap_for_back and _db_at(ct.start_ms) >= speech_thresh - 4.0:
             floor_ms = prev_end + 40 if i > 0 else 0
             limit_back = max(floor_ms, ct.start_ms - 130)
             scan = ct.start_ms - 10
@@ -850,54 +1101,83 @@ def _refine_char_boundaries_with_acoustics(
                         break
                 scan -= 10
             if earliest is not None and ct.start_ms - earliest >= 20:
-                ct.start_ms = max(floor_ms, earliest - 15)
+                ct.start_ms = max(floor_ms, earliest - 10)
 
         # 3. Trim trailing silence overshoot at utterance end or pre-pause char
         has_gap_after = (i == len(char_timings) - 1) or (next_start - ct.end_ms >= 120)
+        trimmed_tail = False
         if (has_gap_after or ct.end_ms - ct.start_ms >= 240) and _db_at(ct.end_ms) < speech_thresh - 2.0:
             scan = ct.end_ms
             found_offset = None
-            min_end = ct.start_ms + 55
+            min_end = ct.start_ms + 50
             while scan >= min_end:
                 if _db_at(scan) >= speech_thresh:
                     found_offset = scan
                     break
                 scan -= 10
-            if found_offset is not None and ct.end_ms - found_offset >= 60:
-                ct.end_ms = min(ct.end_ms, max(min_end, found_offset + 35))
+            if found_offset is not None and ct.end_ms - found_offset >= 40:
+                ct.end_ms = min(ct.end_ms, max(min_end, found_offset + 20))
+                trimmed_tail = True
+
+        # 4. Extend utterance-final / pre-pause boundary when aligner cuts off active vocal tail early
+        is_tail_edge = (i == len(char_timings) - 1) or (next_start - ct.end_ms >= 260)
+        if not trimmed_tail and is_tail_edge and _db_at(ct.end_ms) >= tail_thresh - 1.5:
+            max_fwd = min(next_start - 40 if i + 1 < len(char_timings) else duration_ms, ct.end_ms + 320)
+            scan = ct.end_ms + 10
+            last_active = ct.end_ms
+            quiet_run = 0
+            while scan <= max_fwd:
+                if _db_at(scan) >= tail_thresh:
+                    last_active = scan
+                    quiet_run = 0
+                else:
+                    quiet_run += 1
+                    if quiet_run >= 2:
+                        break
+                scan += 10
+            if last_active >= ct.end_ms + 20:
+                ct.end_ms = min(max_fwd, last_active + 15)
 
 
-def run_alignment_and_segmentation(
+def run_forced_alignment_only(
     raw_cues: list[SubtitleCue],
     audio_16k: np.ndarray,
     vad_spans: list[tuple[int, int]],
     duration_ms: int,
-    template: SubtitleTemplate,
     alignment_cfg: AlignmentConfig,
     cache_dir: Path,
     *,
-    video_fps: float = 25.0,
     script_path: str | Path | None = None,
+    language: str = "auto",
+    apply_script_turns: bool = True,
+    skip_global_offset: bool = False,
+    unload_after: bool = True,
     progress_cb: Callable[[float, str], None] | None = None,
-) -> AlignmentEngineResult:
-    """Execute the full 7-step forced alignment and semantic segmentation workflow."""
+) -> ForcedAlignmentStageResult:
+    """Run Stage 3A: forced alignment & 10ms acoustic boundary refinement (independent of subtitle layout template)."""
+    eff_lang = (
+        language
+        if language in {"zh", "en"}
+        else detect_text_language(" ".join(c.raw_text for c in raw_cues))
+    )
+
     if not raw_cues:
-        return AlignmentEngineResult(
-            cues=[],
-            anomalies=[],
+        return ForcedAlignmentStageResult(
+            aligned_windows=[],
             global_offset_ms=0,
             aligner_used="none",
-            nlp_used=alignment_cfg.nlp_backend,
-            text_integrity_ok=True,
+            effective_language=eff_lang,
+            extra_phrases=[],
+            pre_warnings=[],
+            script_mismatch_ratio=None,
         )
 
-    # Optional dialogue script parsing & turn alignment
     script_doc: ScriptDocument | None = None
     cue_turn_map: dict[int, list[int]] = {}
     cue_hint_map: dict[int, list[str]] = {}
     script_matched = False
     script_mismatch_ratio: float | None = None
-    if script_path and Path(script_path).is_file():
+    if apply_script_turns and script_path and Path(script_path).is_file():
         try:
             script_doc = parse_dialogue_script(script_path)
             if script_doc.characters:
@@ -919,42 +1199,89 @@ def run_alignment_and_segmentation(
     funasr_be = FunASRAlignerBackend(cache_dir)
     qwen_be = Qwen3AlignerBackend(cache_dir)
 
-    # Select backend
     chosen_be = None
-    if alignment_cfg.backend == "qwen3" and qwen_be.is_available():
-        chosen_be = qwen_be
-    elif alignment_cfg.backend == "funasr" and funasr_be.is_available():
-        chosen_be = funasr_be
-    elif alignment_cfg.backend == "auto":
-        # Prefer Qwen3 if cached & CUDA available with sufficient VRAM, otherwise FunASR fa-zh
-        if funasr_be.is_available() and qwen_be.is_available():
-            import torch
-            free_mb = 0
-            if torch.cuda.is_available() and alignment_cfg.device != "cpu":
-                try:
-                    free_mb = torch.cuda.mem_get_info(0)[0] / (1024 * 1024)
-                except Exception:
-                    free_mb = 0
-            chosen_be = qwen_be if free_mb >= 2300 else funasr_be
-        elif funasr_be.is_available():
-            chosen_be = funasr_be
-        elif qwen_be.is_available():
+    pre_warnings: list[AnomalyItem] = []
+    if eff_lang == "en":
+        if alignment_cfg.backend == "funasr":
+            pre_warnings.append(
+                AnomalyItem(
+                    anomaly_type=AnomalyType.LOW_CONFIDENCE,
+                    severity=AnomalySeverity.INFO,
+                    start_ms=0,
+                    end_ms=duration_ms,
+                    cue_index=None,
+                    message="英文项目不可使用中文专用 FunASR fa-zh 对齐模型，已自动切换至 Qwen3-ForcedAligner / VAD。",
+                    suggestion="如需英文词级高精度对齐，请下载 Qwen3-ForcedAligner-0.6B。",
+                )
+            )
+        if alignment_cfg.backend != "vad_fallback" and qwen_be.is_available():
             chosen_be = qwen_be
+    else:
+        if alignment_cfg.backend == "qwen3" and qwen_be.is_available():
+            chosen_be = qwen_be
+        elif alignment_cfg.backend == "funasr" and funasr_be.is_available():
+            chosen_be = funasr_be
+        elif alignment_cfg.backend == "auto":
+            if funasr_be.is_available() and qwen_be.is_available():
+                import torch
+                free_mb = 0
+                if torch.cuda.is_available() and alignment_cfg.device != "cpu":
+                    try:
+                        free_mb = torch.cuda.mem_get_info(0)[0] / (1024 * 1024)
+                    except Exception:
+                        free_mb = 0
+                chosen_be = qwen_be if free_mb >= 2300 else funasr_be
+            elif funasr_be.is_available():
+                chosen_be = funasr_be
+            elif qwen_be.is_available():
+                chosen_be = qwen_be
 
-    aligner_label = chosen_be.name if chosen_be else "VAD 回退对齐 (建议下载 fa-zh 或 Qwen3 模型)"
+    if chosen_be is None and alignment_cfg.backend != "vad_fallback" and not alignment_cfg.allow_vad_fallback:
+        if eff_lang == "en":
+            raise MissingAlignerModelError(
+                "qwen3_aligner",
+                "未安装英文可用强制对齐模型 Qwen3-ForcedAligner-0.6B（英文不可使用中文专用 FunASR fa-zh），"
+                "为避免生成估算时间码已中止对齐。请在「模型下载与缓存」中下载 Qwen3-ForcedAligner-0.6B 后重试。",
+            )
+        rec_model = "qwen3_aligner" if alignment_cfg.backend == "qwen3" else "funasr_fa"
+        raise MissingAlignerModelError(
+            rec_model,
+            "未检测到本地声学强制对齐模型（Qwen3-ForcedAligner-0.6B / FunASR fa-zh），"
+            "为避免生成按字数比例估算的伪时间码已中止对齐。请在「模型下载与缓存」中下载对齐模型后重试。",
+        )
 
-    # Step 3: Global & per-cue timeline drift detection
+    if chosen_be is None:
+        pre_warnings.append(
+            AnomalyItem(
+                anomaly_type=AnomalyType.LOW_CONFIDENCE,
+                severity=AnomalySeverity.WARNING,
+                start_ms=0,
+                end_ms=duration_ms,
+                cue_index=None,
+                message="当前未启用声学强制对齐模型，字幕时间码为 VAD 语音区间按字数比例估算结果（非逐字声学对齐）。",
+                suggestion="建议在「模型下载与缓存」中下载 Qwen3-ForcedAligner-0.6B 或 FunASR fa-zh 后重新执行对齐。",
+            )
+        )
+
+    aligner_label = chosen_be.name if chosen_be else (
+        "VAD 回退对齐 (估算时间轴 · 建议下载 Qwen3-ForcedAligner-0.6B)"
+        if eff_lang == "en"
+        else "VAD 回退对齐 (估算时间轴 · 建议下载 fa-zh 或 Qwen3 模型)"
+    )
+
     global_offset = 0
     anchored_bounds: dict[int, tuple[int, int]] = {}
-    if alignment_cfg.detect_global_offset:
+    if alignment_cfg.detect_global_offset and not skip_global_offset:
         if progress_cb:
-            progress_cb(0.30, "检测剪映时间轴与视频语音偏移...")
-        if funasr_be.has_asr_anchor():
+            progress_cb(0.30, "检测字幕时间轴与视频语音偏移...")
+        if eff_lang != "en" and funasr_be.has_asr_anchor():
             try:
                 asr_anchors = funasr_be.transcribe_anchors(audio_16k, device=alignment_cfg.device)
                 anchored_bounds = _anchor_cues_with_asr(raw_cues, asr_anchors)
             except Exception:
                 anchored_bounds = {}
+            finally:
+                MODEL_POOL.unload_role("asr")
         global_offset = _estimate_global_vad_offset(raw_cues, vad_spans, duration_ms)
 
     windows = _group_cues_into_windows(
@@ -966,84 +1293,209 @@ def run_alignment_and_segmentation(
         max_window_ms=24000 if chosen_be is qwen_be else 22000,
     )
 
-    processed_cues: list[SubtitleCue] = []
+    aligned_windows: list[AlignedUtteranceData] = []
     used_backend_runtime = aligner_label
-    global_turn_base = 0
-    extra_phrases = script_doc.characters if script_doc is not None else None
+    extra_phrases = list(script_doc.characters) if script_doc is not None else []
 
-    for w_idx, win in enumerate(windows):
-        if progress_cb:
-            frac = 0.35 + 0.32 * (w_idx / max(1, len(windows)))
-            progress_cb(frac, f"正在语音强制对齐与语义断句 ({w_idx + 1}/{len(windows)})...")
+    try:
+        # Run batched alignment upfront when backend supports GPU batching (e.g. Qwen3-ForcedAligner)
+        batched_outputs: list | None = None
+        batch_fn = getattr(chosen_be, "align_utterances_batch", None) if chosen_be is not None else None
+        if callable(batch_fn) and windows:
+            win_spoken = [bool(extract_canonical_spoken_sequence(w.clean_text)) for w in windows]
+            active_idx = [idx for idx, ok in enumerate(win_spoken) if ok]
+            if active_idx:
+                batch_items = [
+                    (windows[idx].window_start_ms, windows[idx].window_end_ms, windows[idx].clean_text)
+                    for idx in active_idx
+                ]
+                try:
+                    batch_res = batch_fn(
+                        audio_16k,
+                        batch_items,
+                        language=eff_lang,
+                        device=alignment_cfg.device,
+                        cache_dir=cache_dir,
+                        progress_cb=progress_cb,
+                    )
+                    batched_outputs = [None] * len(windows)
+                    for idx, out_item in zip(active_idx, batch_res):
+                        batched_outputs[idx] = out_item
+                except Exception as exc:
+                    batched_outputs = None
+                    used_backend_runtime = f"{aligner_label} (批处理回退单条: {exc})"
 
-        win_char_turns, win_char_hints, per_cue_turn = _compute_window_turn_ids(
-            win.cues,
-            cue_turn_map,
-            cue_hint_map,
-            script_matched,
-        )
-        max_local_turn = max(win_char_turns, default=0)
+        for w_idx, win in enumerate(windows):
+            if progress_cb and batched_outputs is None:
+                frac = 0.35 + 0.30 * (w_idx / max(1, len(windows)))
+                progress_cb(frac, f"正在语音强制对齐 ({w_idx + 1}/{len(windows)})...")
 
-        spoken_clean = extract_canonical_spoken_sequence(win.clean_text)
-        char_timings: list[CharTimestamp] = []
+            win_char_turns, win_char_hints, per_cue_turn = _compute_window_turn_ids(
+                win.cues,
+                cue_turn_map,
+                cue_hint_map,
+                script_matched,
+            )
+            if not script_matched and any(c.turn_id != 0 for c in win.cues):
+                win_char_turns = []
+                per_cue_turn = []
+                turn_remap: dict[int, int] = {}
+                for c in win.cues:
+                    mapped_t = turn_remap.setdefault(c.turn_id, len(turn_remap))
+                    per_cue_turn.append(mapped_t)
+                    c_len = len(extract_canonical_spoken_sequence(c.raw_text))
+                    win_char_turns.extend([mapped_t] * max(0, c_len))
 
-        if chosen_be is not None and spoken_clean:
-            try:
-                out = chosen_be.align_utterance(
-                    audio_16k,
-                    win.window_start_ms,
-                    win.window_end_ms,
-                    win.clean_text,
-                    device=alignment_cfg.device,
-                    cache_dir=cache_dir,
+            max_local_turn = max(win_char_turns, default=0)
+            spoken_clean = extract_canonical_spoken_sequence(win.clean_text)
+            char_timings: list[CharTimestamp] = []
+
+            if chosen_be is not None and spoken_clean:
+                try:
+                    if batched_outputs is not None and batched_outputs[w_idx] is not None:
+                        out = batched_outputs[w_idx]
+                    else:
+                        out = chosen_be.align_utterance(
+                            audio_16k,
+                            win.window_start_ms,
+                            win.window_end_ms,
+                            win.clean_text,
+                            language=eff_lang,
+                            device=alignment_cfg.device,
+                            cache_dir=cache_dir,
+                        )
+                    char_timings = out.char_timings
+                    used_backend_runtime = out.backend_name
+
+                    # Rescue isolated short utterance if ForcedAligner latched onto leading silence
+                    if char_timings and vad_spans:
+                        al_s, al_e = char_timings[0].start_ms, char_timings[-1].end_ms
+                        ov_init = _vad_overlap_ratio(al_s, al_e, vad_spans)
+                        if ov_init < 0.25 and len(win.cues) == 1:
+                            cand_vad = [
+                                (vs, ve)
+                                for vs, ve in vad_spans
+                                if ve >= win.window_start_ms - 800 and vs <= win.window_end_ms + 800 and (ve - vs) >= 80
+                            ]
+                            if cand_vad:
+                                al_mid = (al_s + al_e) // 2
+                                vs_near, ve_near = min(cand_vad, key=lambda sp: abs(((sp[0] + sp[1]) // 2) - al_mid))
+                                retry_s = max(0, vs_near - 120)
+                                retry_e = min(duration_ms, ve_near + 120)
+                                if retry_e - retry_s >= 180 and (retry_s != win.window_start_ms or retry_e != win.window_end_ms):
+                                    out_retry = chosen_be.align_utterance(
+                                        audio_16k,
+                                        retry_s,
+                                        retry_e,
+                                        win.clean_text,
+                                        language=eff_lang,
+                                        device=alignment_cfg.device,
+                                        cache_dir=cache_dir,
+                                    )
+                                    if out_retry.char_timings:
+                                        ov_retry = _vad_overlap_ratio(
+                                            out_retry.char_timings[0].start_ms,
+                                            out_retry.char_timings[-1].end_ms,
+                                            vad_spans,
+                                        )
+                                        if ov_retry >= ov_init + 0.25:
+                                            char_timings = out_retry.char_timings
+                except Exception as exc:
+                    char_timings = []
+                    used_backend_runtime = f"{aligner_label} (异常回退: {exc})"
+
+            if not char_timings:
+                char_timings = _vad_fallback_align(audio_16k, win, vad_spans)
+
+            _trim_char_trailing_silence(char_timings, vad_spans)
+            _refine_char_boundaries_with_acoustics(char_timings, audio_16k, duration_ms)
+
+            for ct in char_timings:
+                ov = _vad_overlap_ratio(ct.start_ms, ct.end_ms, vad_spans)
+                if ov == 0.0:
+                    ct.confidence = min(ct.confidence, 0.42)
+
+            aligned_windows.append(
+                AlignedUtteranceData(
+                    clean_text=win.clean_text,
+                    window_start_ms=win.window_start_ms,
+                    window_end_ms=win.window_end_ms,
+                    char_timings=char_timings,
+                    win_char_turns=win_char_turns,
+                    win_char_hints=win_char_hints,
+                    per_cue_turn=per_cue_turn,
+                    cues_snapshot=deepcopy(win.cues),
+                    max_local_turn=max_local_turn,
                 )
-                char_timings = out.char_timings
-                used_backend_runtime = out.backend_name
-            except Exception as exc:
-                char_timings = []
-                used_backend_runtime = f"{aligner_label} (异常回退: {exc})"
+            )
+    finally:
+        if unload_after:
+            MODEL_POOL.unload_role("aligner")
 
-        if not char_timings:
-            char_timings = _vad_fallback_align(audio_16k, win, vad_spans)
+    return ForcedAlignmentStageResult(
+        aligned_windows=aligned_windows,
+        global_offset_ms=global_offset,
+        aligner_used=used_backend_runtime,
+        effective_language=eff_lang,
+        extra_phrases=extra_phrases,
+        pre_warnings=pre_warnings,
+        script_mismatch_ratio=script_mismatch_ratio,
+    )
 
-        _trim_char_trailing_silence(char_timings, vad_spans)
-        _refine_char_boundaries_with_acoustics(char_timings, audio_16k, duration_ms)
 
-        # Calibrate per-character confidence using VAD & local RMS energy
-        for ct in char_timings:
-            ov = _vad_overlap_ratio(ct.start_ms, ct.end_ms, vad_spans)
-            if ov == 0.0:
-                ct.confidence = min(ct.confidence, 0.42)
+def segment_aligned_windows_to_cues(
+    raw_cues: list[SubtitleCue],
+    align_stage: ForcedAlignmentStageResult,
+    audio_16k: np.ndarray,
+    vad_spans: list[tuple[int, int]],
+    duration_ms: int,
+    template: SubtitleTemplate,
+    alignment_cfg: AlignmentConfig,
+    *,
+    video_fps: float = 25.0,
+) -> AlignmentEngineResult:
+    """Run Stage 3B: DP semantic segmentation, padding/bridging, and QA checks from cached forced alignments."""
+    if not raw_cues or not align_stage.aligned_windows:
+        return AlignmentEngineResult(
+            cues=[],
+            anomalies=list(align_stage.pre_warnings),
+            global_offset_ms=align_stage.global_offset_ms,
+            aligner_used=align_stage.aligner_used,
+            nlp_used=alignment_cfg.nlp_backend,
+            text_integrity_ok=True,
+        )
 
-        # Step 5: Semantic Segmentation (DP) or Non-splitting alignment
+    eff_lang = template.language if template.language in {"zh", "en"} else align_stage.effective_language
+    processed_cues: list[SubtitleCue] = []
+    global_turn_base = 0
+    extra_phrases = align_stage.extra_phrases or None
+    if extra_phrases:
+        register_custom_words(extra_phrases)
+
+    for win_data in align_stage.aligned_windows:
+        win_is_interpolated = bool(win_data.char_timings) and (
+            sum(1 for ct in win_data.char_timings if ct.interpolated) / len(win_data.char_timings) >= 0.8
+        )
         if template.smart_semantic_split and template.auto_split_long:
             tokens = build_unit_tokens(
-                win.clean_text,
-                char_timings,
-                fallback_start_ms=win.window_start_ms,
-                fallback_end_ms=win.window_end_ms,
+                win_data.clean_text,
+                win_data.char_timings,
+                fallback_start_ms=win_data.window_start_ms,
+                fallback_end_ms=win_data.window_end_ms,
                 nlp_backend=alignment_cfg.nlp_backend,
-                char_turn_ids=win_char_turns,
-                char_punct_hints=win_char_hints,
+                char_turn_ids=win_data.win_char_turns,
+                char_punct_hints=win_data.win_char_hints,
                 extra_phrases=extra_phrases,
+                language=eff_lang,
             )
             segs = segment_tokens_dp(tokens, template)
             for s_i, e_i, disp_txt, _ in segs:
                 sub_toks = tokens[s_i:e_i]
-                raw_sub = "".join(t.raw_with_punct for t in sub_toks).strip()
+                raw_sub = _join_sub_tokens_raw(sub_toks, eff_lang)
                 avg_conf = sum(t.confidence for t in sub_toks) / max(1, len(sub_toks))
-                sub_chars = [
-                    CharTimestamp(
-                        char=t.text,
-                        start_ms=t.start_ms,
-                        end_ms=t.end_ms,
-                        confidence=t.confidence,
-                    )
-                    for t in sub_toks
-                ]
-                # Estimate originating SRT cue timestamps for comparison
-                orig_s = win.cues[0].orig_start_ms
-                orig_e = win.cues[-1].orig_end_ms
+                sub_chars = _tokens_to_char_timings(sub_toks, interpolated=win_is_interpolated)
+                orig_s = win_data.cues_snapshot[0].orig_start_ms
+                orig_e = win_data.cues_snapshot[-1].orig_end_ms
                 processed_cues.append(
                     SubtitleCue(
                         index=len(processed_cues) + 1,
@@ -1055,25 +1507,24 @@ def run_alignment_and_segmentation(
                         orig_end_ms=orig_e,
                         confidence=avg_conf,
                         char_timings=sub_chars,
-                        source_cue_indices=[c.index for c in win.cues],
+                        source_cue_indices=[c.index for c in win_data.cues_snapshot],
                         turn_id=global_turn_base + sub_toks[0].turn_id,
                     )
                 )
         else:
-            # Keep original cue boundaries in text, update start/end from char_timings sequentially
             cursor = 0
-            for c_i, orig_cue in enumerate(win.cues):
+            for c_i, orig_cue in enumerate(win_data.cues_snapshot):
                 c_spoken = extract_canonical_spoken_sequence(orig_cue.raw_text)
                 cnt = len(c_spoken)
-                slice_ct = char_timings[cursor : cursor + cnt]
+                slice_ct = win_data.char_timings[cursor : cursor + cnt]
                 cursor += cnt
                 if slice_ct:
                     s_ms = slice_ct[0].start_ms
                     e_ms = slice_ct[-1].end_ms
                     conf = sum(x.confidence for x in slice_ct) / len(slice_ct)
                 else:
-                    s_ms = max(0, orig_cue.start_ms + global_offset)
-                    e_ms = min(duration_ms, max(s_ms + 200, orig_cue.end_ms + global_offset))
+                    s_ms = max(0, orig_cue.start_ms + align_stage.global_offset_ms)
+                    e_ms = min(duration_ms, max(s_ms + 200, orig_cue.end_ms + align_stage.global_offset_ms))
                     conf = 0.35
 
                 if template.smart_semantic_split:
@@ -1088,7 +1539,7 @@ def run_alignment_and_segmentation(
                         if template.remove_punctuation
                         else orig_cue.raw_text
                     )
-                cue_t = per_cue_turn[c_i] if c_i < len(per_cue_turn) else c_i
+                cue_t = win_data.per_cue_turn[c_i] if c_i < len(win_data.per_cue_turn) else c_i
                 processed_cues.append(
                     SubtitleCue(
                         index=len(processed_cues) + 1,
@@ -1104,13 +1555,12 @@ def run_alignment_and_segmentation(
                         turn_id=global_turn_base + cue_t,
                     )
                 )
-
-        global_turn_base += max_local_turn + 1
+        global_turn_base += win_data.max_local_turn + 1
 
     final_cues = _apply_padding_and_merge(processed_cues, template, duration_ms, video_fps=video_fps)
     integrity_ok, integrity_msg = verify_text_integrity(raw_cues, final_cues)
 
-    anomalies = run_quality_checks(
+    anomalies = list(align_stage.pre_warnings) + run_quality_checks(
         final_cues,
         template,
         vad_spans,
@@ -1118,7 +1568,7 @@ def run_alignment_and_segmentation(
         duration_ms,
         low_conf_thresh=alignment_cfg.low_confidence_threshold,
     )
-    if script_mismatch_ratio is not None:
+    if align_stage.script_mismatch_ratio is not None:
         anomalies.insert(
             0,
             AnomalyItem(
@@ -1127,7 +1577,7 @@ def run_alignment_and_segmentation(
                 start_ms=0,
                 end_ms=duration_ms,
                 cue_index=None,
-                message=f"台词文稿与 SRT 文本匹配度偏低（{script_mismatch_ratio:.0%}），已忽略说话轮次绑定。",
+                message=f"台词文稿与 SRT 文本匹配度偏低（{align_stage.script_mismatch_ratio:.0%}），已忽略说话轮次绑定。",
                 suggestion="请确认是否为当前集对应的台词文稿。",
             ),
         )
@@ -1148,8 +1598,52 @@ def run_alignment_and_segmentation(
     return AlignmentEngineResult(
         cues=final_cues,
         anomalies=anomalies,
-        global_offset_ms=global_offset,
-        aligner_used=used_backend_runtime,
+        global_offset_ms=align_stage.global_offset_ms,
+        aligner_used=align_stage.aligner_used,
         nlp_used=alignment_cfg.nlp_backend,
         text_integrity_ok=integrity_ok,
+    )
+
+
+def run_alignment_and_segmentation(
+    raw_cues: list[SubtitleCue],
+    audio_16k: np.ndarray,
+    vad_spans: list[tuple[int, int]],
+    duration_ms: int,
+    template: SubtitleTemplate,
+    alignment_cfg: AlignmentConfig,
+    cache_dir: Path,
+    *,
+    video_fps: float = 25.0,
+    script_path: str | Path | None = None,
+    language: str = "auto",
+    apply_script_turns: bool = True,
+    skip_global_offset: bool = False,
+    unload_after: bool = True,
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> AlignmentEngineResult:
+    """Execute the full forced alignment and semantic segmentation workflow (Chinese & English)."""
+    align_stage = run_forced_alignment_only(
+        raw_cues=raw_cues,
+        audio_16k=audio_16k,
+        vad_spans=vad_spans,
+        duration_ms=duration_ms,
+        alignment_cfg=alignment_cfg,
+        cache_dir=cache_dir,
+        script_path=script_path,
+        language=language,
+        apply_script_turns=apply_script_turns,
+        skip_global_offset=skip_global_offset,
+        unload_after=unload_after,
+        progress_cb=progress_cb,
+    )
+    return segment_aligned_windows_to_cues(
+        raw_cues=raw_cues,
+        align_stage=align_stage,
+        audio_16k=audio_16k,
+        vad_spans=vad_spans,
+        duration_ms=duration_ms,
+        template=template,
+        alignment_cfg=alignment_cfg,
+        video_fps=video_fps,
     )

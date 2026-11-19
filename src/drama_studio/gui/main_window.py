@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import time
 
-from PySide6.QtCore import QEvent, Qt, QUrl
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QDesktopServices,
     QDragEnterEvent,
@@ -26,27 +28,36 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
+    QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from drama_studio import __app_name__, __brand_name__
 from drama_studio.align.engine import relayout_cues_with_template, run_quality_checks
+from drama_studio.align.model_manager import check_model_vram_risk
 from drama_studio.audio.vad import to_16k_mono
-from drama_studio.config import ConfigStore, default_app_data_dir
+from drama_studio.config import ConfigStore, default_work_cache_dir
 from drama_studio.exporters.exporter import export_episode_outputs
 from drama_studio.gui.theme import (
     THEME_ORDER,
@@ -66,8 +77,12 @@ from drama_studio.gui.widgets.subtitle_editor import SubtitleEditorPanel
 from drama_studio.gui.widgets.template_panel import TemplateSettingsPanel
 from drama_studio.gui.widgets.themed_controls import ThemedComboBox, apply_win11_dwm_chrome
 from drama_studio.gui.widgets.waveform_timeline import WaveformTimelineWidget
-from drama_studio.gui.workers import AudioRelevelWorker, MediaProbeWorker, ProcessingWorker
-from drama_studio.media.pairing import assign_script_files_to_tasks, pair_media_files
+from drama_studio.gui.workers import AudioRelevelWorker, MediaProbeWorker, ProcessingWorker, RelayoutWorker
+from drama_studio.media.pairing import (
+    assign_script_files_to_tasks,
+    disambiguate_episode_labels,
+    pair_media_files,
+)
 from drama_studio.models import (
     AudioLevelingConfig,
     EpisodeTask,
@@ -140,6 +155,58 @@ class AuroraCanvasWidget(QWidget):
         p.fillRect(0, 0, int(w), int(h), g3)
 
 
+class EngineExportSettingsDialog(QDialog):
+    """Secondary settings dialog hosting low-frequency AI backend, device, and export format controls."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("处理引擎与导出参数设置")
+        self.setModal(True)
+        self.resize(470, 320)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        ai_box = QGroupBox("AI 强制对齐与硬件推理")
+        ai_form = QFormLayout(ai_box)
+        ai_form.setSpacing(8)
+        self.combo_aligner = ThemedComboBox()
+        self.combo_aligner.addItem("自动优选 (中文可选 FunASR / 双语推荐 Qwen3)", "auto")
+        self.combo_aligner.addItem("Qwen3-ForcedAligner (中英通用精修)", "qwen3")
+        self.combo_aligner.addItem("FunASR fa-zh (仅限中文快速模式)", "funasr")
+        self.combo_aligner.addItem("仅 VAD 辅助 (无强制对齐模型时兜底)", "vad_fallback")
+        self.combo_device = ThemedComboBox()
+        self.combo_device.addItem("自动 (GPU 优先，显存不足自动降级)", "auto")
+        self.combo_device.addItem("CUDA GPU 加速", "cuda")
+        self.combo_device.addItem("CPU 安全模式", "cpu")
+        ai_form.addRow("强制对齐引擎:", self.combo_aligner)
+        ai_form.addRow("推理计算设备:", self.combo_device)
+        lay.addWidget(ai_box)
+
+        exp_box = QGroupBox("导出音频规格与防覆盖策略")
+        exp_form = QFormLayout(exp_box)
+        exp_form.setSpacing(8)
+        self.combo_bit_depth = ThemedComboBox()
+        self.combo_bit_depth.addItem("24-bit / 48 kHz PCM (广播与达芬奇推荐)", 24)
+        self.combo_bit_depth.addItem("16-bit / 48 kHz PCM (兼容体积较小)", 16)
+        self.chk_mux_mp4 = QCheckBox("同步封装导出参考 MP4 视频（自动嵌入新字幕与新音轨）")
+        hint = QLabel("安全导出：同一目录下自动使用 _v2 / _v3 后缀，绝不覆盖原始粗剪或已有成品。")
+        hint.setObjectName("MutedLabel")
+        hint.setWordWrap(True)
+        exp_form.addRow("WAV 音频位深:", self.combo_bit_depth)
+        exp_form.addRow("视频封装选项:", self.chk_mux_mp4)
+        exp_form.addRow("", hint)
+        lay.addWidget(exp_box)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn is not None:
+            ok_btn.setText("完成")
+        btns.accepted.connect(self.accept)
+        lay.addWidget(btns)
+
+
 class MainWindow(QMainWindow):
     """Complete Windows desktop studio for AI short-drama audio leveling and subtitle alignment."""
 
@@ -150,8 +217,8 @@ class MainWindow(QMainWindow):
         icon_p = resolve_asset_path("app_icon.ico") or resolve_asset_path("app_icon.png")
         if icon_p is not None:
             self.setWindowIcon(QIcon(str(icon_p)))
-        self.resize(1580, 960)
-        self.setMinimumSize(1260, 760)
+        self.resize(1540, 920)
+        self.setMinimumSize(1160, 720)
         self.setAcceptDrops(True)
 
         self.undo_stack = QUndoStack(self)
@@ -160,18 +227,43 @@ class MainWindow(QMainWindow):
         self.current_task_id: str = ""
 
         self._probe_worker: MediaProbeWorker | None = None
+        self._probe_workers: list[MediaProbeWorker] = []
         self._proc_worker: ProcessingWorker | None = None
         self._relevel_worker: AudioRelevelWorker | None = None
+        self._relayout_worker: RelayoutWorker | None = None
         self._audio_16k_cache: dict[str, object] = {}
         self._last_scrub_cue_idx: int = -1
+        self._last_prog_ui_ts: float = 0.0
+        self._last_prog_pct: int = -1
         self._manual_aspect_tasks: set[str] = set()
         self._auto_switched_aspect: bool = False
         self._suppress_project_template_save: bool = False
+        self._loading_project_ui: bool = False
+        self._handled_missing_model_tasks: set[str] = set()
+        self._last_known_lang: str = "zh"
+
+        self._save_prefs_timer = QTimer(self)
+        self._save_prefs_timer.setSingleShot(True)
+        self._save_prefs_timer.setInterval(250)
+        self._save_prefs_timer.timeout.connect(self._save_project_settings)
+
+        self._pending_preview_text: str = ""
+        self._preview_sync_timer = QTimer(self)
+        self._preview_sync_timer.setSingleShot(True)
+        self._preview_sync_timer.setInterval(70)
+        self._preview_sync_timer.timeout.connect(self._flush_preview_sample_text)
+
+        self._engine_settings_dlg = EngineExportSettingsDialog(self)
+        self.combo_aligner = self._engine_settings_dlg.combo_aligner
+        self.combo_device = self._engine_settings_dlg.combo_device
+        self.combo_bit_depth = self._engine_settings_dlg.combo_bit_depth
+        self.chk_mux_mp4 = self._engine_settings_dlg.chk_mux_mp4
 
         self._build_central()
         self._build_statusbar()
         self._load_active_project_to_ui()
         self._connect_signals()
+        self._refresh_engine_settings_summary()
         self.apply_theme(self.store.preferences.get("theme_mode", "light"), save=False)
 
         app = QApplication.instance()
@@ -181,23 +273,23 @@ class MainWindow(QMainWindow):
     def _build_header_bar(self) -> QFrame:
         header = FrostedHeaderBar()
         h_lay = QVBoxLayout(header)
-        h_lay.setContentsMargins(14, 10, 14, 10)
-        h_lay.setSpacing(8)
+        h_lay.setContentsMargins(14, 9, 14, 9)
+        h_lay.setSpacing(7)
 
-        # --- Row 1: Brand + Project + AI Engine + Undo/Redo + Models ---
+        # --- Row 1: Brand + Project + Language + ASR Model + Secondary Dialogs + Theme ---
         row1 = QHBoxLayout()
-        row1.setSpacing(8)
+        row1.setSpacing(6)
 
         avatar_path = resolve_asset_path("app_icon.png")
         if avatar_path is not None:
             avatar_lbl = QLabel()
             avatar_lbl.setObjectName("BrandAvatar")
-            avatar_lbl.setFixedSize(30, 30)
+            avatar_lbl.setFixedSize(28, 28)
             pm = QPixmap(str(avatar_path))
             if not pm.isNull():
                 pm = pm.scaled(
-                    60,
-                    60,
+                    56,
+                    56,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
@@ -207,44 +299,50 @@ class MainWindow(QMainWindow):
 
         brand = QLabel(__brand_name__)
         brand.setObjectName("BrandTitle")
-        badge = QLabel("AI 短剧工作站")
-        badge.setObjectName("BrandBadge")
         row1.addWidget(brand)
-        row1.addWidget(badge)
-        row1.addSpacing(10)
+        row1.addSpacing(8)
 
         row1.addWidget(QLabel("项目:"))
         self.combo_project = ThemedComboBox()
-        self.combo_project.setMinimumWidth(145)
-        self.btn_new_proj = QPushButton("新建")
-        self.btn_del_proj = QPushButton("删除")
+        self.combo_project.setMinimumWidth(100)
+        self.btn_new_proj = QPushButton("＋")
+        self.btn_new_proj.setFixedWidth(32)
+        self.btn_new_proj.setToolTip("新建项目")
+        self.btn_del_proj = QPushButton("－")
+        self.btn_del_proj.setFixedWidth(32)
+        self.btn_del_proj.setToolTip("删除当前项目")
         row1.addWidget(self.combo_project)
         row1.addWidget(self.btn_new_proj)
         row1.addWidget(self.btn_del_proj)
-        row1.addSpacing(8)
+        row1.addSpacing(4)
 
-        row1.addWidget(QLabel("对齐引擎:"))
-        self.combo_aligner = ThemedComboBox()
-        self.combo_aligner.addItem("自动优选 (推荐)", "auto")
-        self.combo_aligner.addItem("FunASR fa-zh (轻量高速)", "funasr")
-        self.combo_aligner.addItem("Qwen3-ForcedAligner-0.6B (高精度)", "qwen3")
-        self.combo_aligner.addItem("仅 VAD 辅助 (无对齐模型)", "vad_fallback")
-        self.combo_aligner.setMinimumWidth(195)
-        row1.addWidget(self.combo_aligner)
+        row1.addWidget(QLabel("语言:"))
+        self.combo_language = ThemedComboBox()
+        self.combo_language.addItem("自动检测", "auto")
+        self.combo_language.addItem("中文", "zh")
+        self.combo_language.addItem("English", "en")
+        self.combo_language.setMinimumWidth(86)
+        row1.addWidget(self.combo_language)
 
-        row1.addWidget(QLabel("设备:"))
-        self.combo_device = ThemedComboBox()
-        self.combo_device.addItem("自动 (GPU优先)", "auto")
-        self.combo_device.addItem("CUDA GPU", "cuda")
-        self.combo_device.addItem("CPU 模式", "cpu")
-        row1.addWidget(self.combo_device)
+        row1.addWidget(QLabel("识别:"))
+        self.combo_asr_model = ThemedComboBox()
+        self.combo_asr_model.addItem("自动 (Qwen3-0.6B)", "auto")
+        self.combo_asr_model.addItem("Qwen3-ASR-0.6B", "qwen3_asr_0.6b")
+        self.combo_asr_model.addItem("Qwen3-ASR-1.7B", "qwen3_asr_1.7b")
+        self.combo_asr_model.addItem("FunASR (仅中文)", "funasr_asr")
+        self.combo_asr_model.setMinimumWidth(142)
+        row1.addWidget(self.combo_asr_model)
 
         row1.addStretch()
 
-        self.btn_undo = QPushButton("撤销")
+        self.btn_undo = QPushButton("↶")
+        self.btn_undo.setFixedWidth(36)
+        self.btn_undo.setToolTip("撤销上一步修改 (Ctrl+Z)")
         self.btn_undo.setShortcut(QKeySequence.StandardKey.Undo)
         self.btn_undo.setEnabled(False)
-        self.btn_redo = QPushButton("重做")
+        self.btn_redo = QPushButton("↷")
+        self.btn_redo.setFixedWidth(36)
+        self.btn_redo.setToolTip("重做修改 (Ctrl+Y)")
         self.btn_redo.setShortcut(QKeySequence.StandardKey.Redo)
         self.btn_redo.setEnabled(False)
         self.undo_stack.canUndoChanged.connect(self.btn_undo.setEnabled)
@@ -252,56 +350,108 @@ class MainWindow(QMainWindow):
         self.btn_undo.clicked.connect(self.undo_stack.undo)
         self.btn_redo.clicked.connect(self.undo_stack.redo)
 
-        self.btn_models = QPushButton("模型下载与缓存")
+        self.btn_engine_settings = QPushButton("⚙ 引擎与导出")
+        self.btn_engine_settings.setToolTip("打开二级设置：配置强制对齐引擎、GPU/CPU 设备、WAV 位深与 MP4 封装")
+        self.btn_models = QPushButton("模型与缓存")
         self.combo_theme = ThemedComboBox()
         for t_mode in THEME_ORDER:
             self.combo_theme.addItem(THEMES[t_mode].display_name, t_mode)
-        self.combo_theme.setMinimumWidth(134)
+        self.combo_theme.setMinimumWidth(112)
         self.combo_theme.setToolTip("切换 纯净白 (浅色) / 曜石黑 (深色) / 浅樱粉 (粉色) 主题")
 
         row1.addWidget(self.btn_undo)
         row1.addWidget(self.btn_redo)
+        row1.addWidget(self.btn_engine_settings)
         row1.addWidget(self.btn_models)
-        row1.addSpacing(4)
-        row1.addWidget(QLabel("主题:"))
         row1.addWidget(self.combo_theme)
         h_lay.addLayout(row1)
 
-        # --- Row 2: Output Options + Primary Action CTAs ---
+        # --- Row 2: Output Dir + Export Scope + Panel Toggles + Single Primary Start CTA ---
         row2 = QHBoxLayout()
-        row2.setSpacing(8)
+        row2.setSpacing(6)
 
-        row2.addWidget(QLabel("导出目录:"))
+        row2.addWidget(QLabel("导出:"))
         self.edit_out_dir = QLineEdit()
-        self.edit_out_dir.setPlaceholderText("默认输出到原视频同级「智能修正输出」文件夹（绝不覆盖源文件）")
-        self.btn_browse_out = QPushButton("选择目录")
+        self.edit_out_dir.setMinimumWidth(140)
+        self.edit_out_dir.setPlaceholderText("默认输出到原视频同级「智能修正输出」文件夹（绝不覆盖已有文件）")
+        self.btn_browse_out = QPushButton("浏览")
 
-        self.combo_bit_depth = ThemedComboBox()
-        self.combo_bit_depth.addItem("WAV 24-bit / 48kHz", 24)
-        self.combo_bit_depth.addItem("WAV 16-bit / 48kHz", 16)
-        self.chk_mux_mp4 = QCheckBox("同步导出替换音轨MP4")
+        self.combo_export_scope = ThemedComboBox()
+        self.combo_export_scope.addItem("字幕 + 音频", "both")
+        self.combo_export_scope.addItem("仅字幕 (SRT)", "srt_only")
+        self.combo_export_scope.addItem("仅音频 (WAV)", "wav_only")
 
-        self.btn_run_one = QPushButton("✦ 一键智能修正")
-        self.btn_run_one.setObjectName("PrimaryButton")
-        self.btn_run_batch = QPushButton("批量处理全部集")
+        self.btn_toggle_import = QPushButton("◧ 素材栏")
+        self.btn_toggle_import.setObjectName("TogglePill")
+        self.btn_toggle_import.setCheckable(True)
+        self.btn_toggle_import.setChecked(bool(self.store.preferences.get("show_import_panel", True)))
+        self.btn_toggle_import.setToolTip("快速展开或收起左侧素材导入与队列栏，给波形和字幕留出更多空间")
+
+        self.btn_toggle_template = QPushButton("◨ 排版栏")
+        self.btn_toggle_template.setObjectName("TogglePill")
+        self.btn_toggle_template.setCheckable(True)
+        self.btn_toggle_template.setChecked(bool(self.store.preferences.get("show_template_panel", True)))
+        self.btn_toggle_template.setToolTip("快速展开或收起右侧字幕模板与规则栏，切换专注精修视野")
+
+        self.combo_run_scope = ThemedComboBox()
+        self.combo_run_scope.addItem("当前集", "current")
+        self.combo_run_scope.addItem("批量全部", "batch")
+
+        self.btn_start = QPushButton("✦ 开始处理")
+        self.btn_start.setObjectName("PrimaryButton")
+
+        self.btn_stage_actions = QToolButton()
+        self.btn_stage_actions.setText("高级单步 ▾")
+        self.btn_stage_actions.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        stage_menu = QMenu(self)
+        self.act_asr_only = QAction("1. 仅运行字幕识别 (Stage 2)", self)
+        self.act_script_match = QAction("2. 仅重新文稿匹配 (复用 ASR)", self)
+        self.act_align_only = QAction("3. 仅重新强制对齐与排版 (Stage 3)", self)
+        self.act_relayout_only = QAction("4. 仅重新字幕排版 (复用对齐)", self)
+        self.act_relevel_only = QAction("5. 仅重新音量均衡 (复用字幕)", self)
+        self.act_reexport = QAction("6. 重新导出当前集结果", self)
+        self.act_force_full = QAction("7. 忽略缓存强制完整重跑", self)
+        for act in (
+            self.act_asr_only,
+            self.act_script_match,
+            self.act_align_only,
+            self.act_relayout_only,
+            self.act_relevel_only,
+            self.act_reexport,
+            self.act_force_full,
+        ):
+            stage_menu.addAction(act)
+        self.btn_stage_actions.setMenu(stage_menu)
+
         self.btn_cancel = QPushButton("取消")
         self.btn_cancel.setObjectName("DangerButton")
         self.btn_cancel.setEnabled(False)
-        self.btn_export = QPushButton("重新导出当前集")
-        self.btn_export.setObjectName("SuccessButton")
-        self.btn_open_out = QPushButton("打开输出目录")
+        self.btn_open_out = QPushButton("打开目录")
 
         row2.addWidget(self.edit_out_dir, 1)
         row2.addWidget(self.btn_browse_out)
-        row2.addWidget(self.combo_bit_depth)
-        row2.addWidget(self.chk_mux_mp4)
-        row2.addSpacing(10)
-        row2.addWidget(self.btn_run_one)
-        row2.addWidget(self.btn_run_batch)
+        row2.addWidget(self.combo_export_scope)
+        row2.addWidget(self.btn_toggle_import)
+        row2.addWidget(self.btn_toggle_template)
+        row2.addWidget(self.combo_run_scope)
+        row2.addWidget(self.btn_start)
+        row2.addWidget(self.btn_stage_actions)
         row2.addWidget(self.btn_cancel)
-        row2.addWidget(self.btn_export)
         row2.addWidget(self.btn_open_out)
         h_lay.addLayout(row2)
+
+        # --- Row 3: Compact 3-Stage Workflow Status Strip ---
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        self.lbl_stage1 = QLabel("① 导入素材：等待导入粗剪视频")
+        self.lbl_stage2 = QLabel("② 字幕识别：语言 - · 模型 - · 对白 0 条 · 异常 0 项")
+        self.lbl_stage3 = QLabel("③ 精修导出：等待对齐、排版与音量均衡")
+        for lbl in (self.lbl_stage1, self.lbl_stage2, self.lbl_stage3):
+            lbl.setObjectName("PillBadge")
+            lbl.setMinimumWidth(90)
+            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            row3.addWidget(lbl, 1)
+        h_lay.addLayout(row3)
 
         return header
 
@@ -309,16 +459,16 @@ class MainWindow(QMainWindow):
         self.central_canvas = AuroraCanvasWidget()
         root_lay = QVBoxLayout(self.central_canvas)
         root_lay.setContentsMargins(12, 10, 12, 8)
-        root_lay.setSpacing(10)
+        root_lay.setSpacing(8)
 
         root_lay.addWidget(self._build_header_bar())
 
-        # Main 3-column horizontal splitter
-        main_split = QSplitter(Qt.Orientation.Horizontal)
-        main_split.setChildrenCollapsible(False)
+        # Main 3-column horizontal splitter (Left & Right can be toggled cleanly via header pills)
+        self.main_split = QSplitter(Qt.Orientation.Horizontal)
+        self.main_split.setChildrenCollapsible(False)
 
         self.import_panel = ImportBatchPanel()
-        self.import_panel.setMinimumWidth(315)
+        self.import_panel.setMinimumWidth(290)
 
         center_container = QWidget()
         center_container.setObjectName("TransparentContainer")
@@ -331,28 +481,34 @@ class MainWindow(QMainWindow):
         self.center_split.setChildrenCollapsible(False)
         self.waveform_widget = WaveformTimelineWidget()
         self.subtitle_editor = SubtitleEditorPanel()
-        self.anomaly_log_panel = AnomalyAndLogPanel()
+        self.anomaly_log_panel = AnomalyAndLogPanel(embedded=True)
+
+        self.center_bottom_tabs = QTabWidget()
+        self.center_bottom_tabs.addTab(self.subtitle_editor, "字幕校对编辑 (0)")
+        self.center_bottom_tabs.addTab(self.anomaly_log_panel.anom_page, "异常检查 (0)")
+        self.center_bottom_tabs.addTab(self.anomaly_log_panel.log_page, "运行日志")
 
         self.center_split.addWidget(self.waveform_widget)
-        self.center_split.addWidget(self.subtitle_editor)
-        self.center_split.addWidget(self.anomaly_log_panel)
-        self.center_split.setStretchFactor(0, 2)
-        self.center_split.setStretchFactor(1, 4)
-        self.center_split.setStretchFactor(2, 1)
-        self.center_split.setSizes([195, 295, 115])
+        self.center_split.addWidget(self.center_bottom_tabs)
+        self.center_split.setStretchFactor(0, 3)
+        self.center_split.setStretchFactor(1, 5)
+        self.center_split.setSizes([235, 395])
 
         center_lay.addWidget(self.audio_panel, 0)
         center_lay.addWidget(self.center_split, 1)
 
         self.template_panel = TemplateSettingsPanel(self.store)
-        self.template_panel.setMinimumWidth(375)
+        self.template_panel.setMinimumWidth(345)
 
-        main_split.addWidget(self.import_panel)
-        main_split.addWidget(center_container)
-        main_split.addWidget(self.template_panel)
-        main_split.setSizes([330, 840, 390])
+        self.main_split.addWidget(self.import_panel)
+        self.main_split.addWidget(center_container)
+        self.main_split.addWidget(self.template_panel)
+        self.main_split.setSizes([315, 860, 365])
 
-        root_lay.addWidget(main_split, 1)
+        self.import_panel.setVisible(self.btn_toggle_import.isChecked())
+        self.template_panel.setVisible(self.btn_toggle_template.isChecked())
+
+        root_lay.addWidget(self.main_split, 1)
         self.setCentralWidget(self.central_canvas)
 
     def _build_statusbar(self) -> None:
@@ -369,19 +525,34 @@ class MainWindow(QMainWindow):
         self.combo_project.currentIndexChanged.connect(self._on_project_switched)
         self.btn_new_proj.clicked.connect(self._create_project)
         self.btn_del_proj.clicked.connect(self._delete_project)
+        self.combo_language.currentIndexChanged.connect(self._on_language_changed)
+        self.combo_asr_model.currentIndexChanged.connect(self._on_asr_model_changed)
         self.combo_aligner.currentIndexChanged.connect(self._save_project_settings)
         self.combo_device.currentIndexChanged.connect(self._save_project_settings)
+        self.btn_engine_settings.clicked.connect(self._open_engine_settings)
         self.btn_models.clicked.connect(self._open_model_manager)
         self.combo_theme.currentIndexChanged.connect(self._on_theme_combo_changed)
+        self.btn_toggle_import.toggled.connect(lambda checked: self._toggle_side_panel("import", checked))
+        self.btn_toggle_template.toggled.connect(lambda checked: self._toggle_side_panel("template", checked))
+        self.anomaly_log_panel.anomaliesCountChanged.connect(
+            lambda count: self.center_bottom_tabs.setTabText(1, f"异常检查 ({count})")
+        )
 
-        self.btn_run_one.clicked.connect(lambda: self._start_processing(batch=False))
-        self.btn_run_batch.clicked.connect(lambda: self._start_processing(batch=True))
+        self.btn_start.clicked.connect(lambda: self._start_processing(stage_action="full"))
+        self.act_asr_only.triggered.connect(lambda: self._start_processing(stage_action="asr_only"))
+        self.act_script_match.triggered.connect(lambda: self._start_processing(stage_action="script_match_only"))
+        self.act_align_only.triggered.connect(lambda: self._start_processing(stage_action="align_only"))
+        self.act_relayout_only.triggered.connect(lambda: self._start_processing(stage_action="relayout_only"))
+        self.act_relevel_only.triggered.connect(lambda: self._start_processing(stage_action="relevel_only"))
+        self.act_reexport.triggered.connect(self._reexport_current)
+        self.act_force_full.triggered.connect(lambda: self._start_processing(stage_action="full", force_recompute=True))
+
         self.btn_cancel.clicked.connect(self._cancel_processing)
-        self.btn_export.clicked.connect(self._reexport_current)
         self.btn_open_out.clicked.connect(self._open_output_folder)
 
         self.btn_browse_out.clicked.connect(self._browse_output_dir)
         self.edit_out_dir.textChanged.connect(self._save_project_settings)
+        self.combo_export_scope.currentIndexChanged.connect(self._save_project_settings)
         self.chk_mux_mp4.toggled.connect(self._save_project_settings)
         self.combo_bit_depth.currentIndexChanged.connect(self._save_project_settings)
 
@@ -390,12 +561,14 @@ class MainWindow(QMainWindow):
         self.import_panel.audioTrackChanged.connect(self._on_audio_track_changed)
         self.import_panel.srtBound.connect(self._on_srt_bound)
         self.import_panel.scriptBound.connect(self._on_script_bound)
+        self.import_panel.taskModeChanged.connect(self._on_task_mode_changed)
         self.import_panel.removeEpisodeRequested.connect(self._on_remove_episode)
 
         self.template_panel.templateChanged.connect(self._on_template_changed)
         self.template_panel.batchModeChanged.connect(self._on_batch_mode_changed)
         self.template_panel.btn_preset_916.clicked.connect(self._on_user_preset_clicked)
         self.template_panel.btn_preset_169.clicked.connect(self._on_user_preset_clicked)
+        self.template_panel.btn_preset_en.clicked.connect(self._on_user_preset_clicked)
 
         self.audio_panel.configChanged.connect(self._on_audio_cfg_changed)
         self.audio_panel.relevelRequested.connect(self._relevel_current_audio)
@@ -404,6 +577,7 @@ class MainWindow(QMainWindow):
 
         self.waveform_widget.canvas.playheadSeeked.connect(self._on_canvas_playhead_seeked)
         self.waveform_widget.canvas.playheadScrubbed.connect(self._on_canvas_playhead_scrubbed)
+        self.waveform_widget.canvas.playheadScrubEnded.connect(self._on_canvas_playhead_scrub_ended)
         self.waveform_widget.canvas.cueSelected.connect(self._on_canvas_cue_selected)
         self.waveform_widget.canvas.cuesEdited.connect(self._on_cues_edited)
         self.waveform_widget.canvas.manualPointsEdited.connect(self._on_manual_points_edited)
@@ -427,49 +601,125 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def _load_active_project_to_ui(self) -> None:
-        self.combo_project.blockSignals(True)
-        self.combo_project.clear()
-        for pid, proj in self.store.projects.items():
-            self.combo_project.addItem(proj.project_name, pid)
-        idx = self.combo_project.findData(self.store.active_project_id)
-        if idx >= 0:
-            self.combo_project.setCurrentIndex(idx)
-        self.combo_project.blockSignals(False)
+        self._loading_project_ui = True
+        try:
+            self.combo_project.blockSignals(True)
+            self.combo_project.clear()
+            for pid, proj in self.store.projects.items():
+                self.combo_project.addItem(proj.project_name, pid)
+            idx = self.combo_project.findData(self.store.active_project_id)
+            if idx >= 0:
+                self.combo_project.setCurrentIndex(idx)
+            self.combo_project.blockSignals(False)
 
-        proj = self.store.get_active_project()
-        self.template_panel.set_template(proj.active_template, emit_signal=False)
-        self.template_panel.chk_unified_batch.setChecked(proj.batch_use_unified_template)
-        self.audio_panel.set_config(proj.audio_config, emit_signal=False)
+            proj = self.store.get_active_project()
+            self.template_panel.set_template(proj.active_template, emit_signal=False)
+            self.template_panel.chk_unified_batch.setChecked(proj.batch_use_unified_template)
+            self.audio_panel.set_config(proj.audio_config, emit_signal=False)
 
-        a_idx = self.combo_aligner.findData(proj.alignment_config.backend)
-        if a_idx >= 0:
-            self.combo_aligner.setCurrentIndex(a_idx)
-        d_idx = self.combo_device.findData(proj.alignment_config.device)
-        if d_idx >= 0:
-            self.combo_device.setCurrentIndex(d_idx)
+            self.combo_language.blockSignals(True)
+            l_idx = self.combo_language.findData(proj.alignment_config.language)
+            self.combo_language.setCurrentIndex(max(0, l_idx))
+            self.combo_language.blockSignals(False)
+            self._last_known_lang = (
+                proj.alignment_config.language
+                if proj.alignment_config.language in {"zh", "en"}
+                else proj.active_template.language
+            )
 
-        self.edit_out_dir.blockSignals(True)
-        self.edit_out_dir.setText(proj.export_config.output_dir)
-        self.edit_out_dir.blockSignals(False)
-        self.chk_mux_mp4.blockSignals(True)
-        self.chk_mux_mp4.setChecked(proj.export_config.export_muxed_mp4)
-        self.chk_mux_mp4.blockSignals(False)
-        b_idx = self.combo_bit_depth.findData(proj.export_config.wav_bit_depth)
-        if b_idx >= 0:
-            self.combo_bit_depth.setCurrentIndex(b_idx)
+            self.combo_asr_model.blockSignals(True)
+            m_idx = self.combo_asr_model.findData(proj.alignment_config.asr_model)
+            self.combo_asr_model.setCurrentIndex(max(0, m_idx))
+            self.combo_asr_model.blockSignals(False)
 
-    def _save_project_settings(self) -> None:
+            a_idx = self.combo_aligner.findData(proj.alignment_config.backend)
+            if a_idx >= 0:
+                self.combo_aligner.setCurrentIndex(a_idx)
+            d_idx = self.combo_device.findData(proj.alignment_config.device)
+            if d_idx >= 0:
+                self.combo_device.setCurrentIndex(d_idx)
+
+            self.edit_out_dir.blockSignals(True)
+            self.edit_out_dir.setText(proj.export_config.output_dir)
+            self.edit_out_dir.blockSignals(False)
+            self.chk_mux_mp4.blockSignals(True)
+            self.chk_mux_mp4.setChecked(proj.export_config.export_muxed_mp4)
+            self.chk_mux_mp4.blockSignals(False)
+            b_idx = self.combo_bit_depth.findData(proj.export_config.wav_bit_depth)
+            if b_idx >= 0:
+                self.combo_bit_depth.setCurrentIndex(b_idx)
+
+            self.combo_export_scope.blockSignals(True)
+            if proj.export_config.export_srt and not proj.export_config.export_wav:
+                scope_val = "srt_only"
+            elif proj.export_config.export_wav and not proj.export_config.export_srt:
+                scope_val = "wav_only"
+            else:
+                scope_val = "both"
+            s_idx = self.combo_export_scope.findData(scope_val)
+            self.combo_export_scope.setCurrentIndex(max(0, s_idx))
+            self.combo_export_scope.blockSignals(False)
+        finally:
+            self._loading_project_ui = False
+        if hasattr(self, "btn_engine_settings"):
+            self._refresh_engine_settings_summary()
+
+    def _sync_project_settings_to_memory(self) -> None:
+        if self._loading_project_ui:
+            return
         proj = self.store.get_active_project()
         if not self._suppress_project_template_save:
-            proj.active_template = self.template_panel.current_template()
+            cur_tpl = self.template_panel.current_template()
+            proj.set_template_for_language(cur_tpl.language, cur_tpl)
         proj.audio_config = self.audio_panel.current_config()
+        proj.alignment_config.language = self.combo_language.currentData() or "auto"
+        proj.alignment_config.asr_model = self.combo_asr_model.currentData() or "auto"
         proj.alignment_config.backend = self.combo_aligner.currentData() or "auto"
         proj.alignment_config.device = self.combo_device.currentData() or "auto"
         proj.export_config.output_dir = self.edit_out_dir.text().strip()
+        exp_scope = self.combo_export_scope.currentData() or "both"
+        proj.export_config.export_srt = exp_scope in {"both", "srt_only"}
+        proj.export_config.export_wav = exp_scope in {"both", "wav_only"}
         proj.export_config.export_muxed_mp4 = self.chk_mux_mp4.isChecked()
         proj.export_config.wav_bit_depth = self.combo_bit_depth.currentData() or 24
         proj.batch_use_unified_template = self.template_panel.chk_unified_batch.isChecked()
+        self._refresh_engine_settings_summary()
+
+    def _save_project_settings(self) -> None:
+        if self._loading_project_ui:
+            return
+        self._sync_project_settings_to_memory()
         self.store.save_projects()
+
+    def _on_language_changed(self, _idx: int) -> None:
+        if self._loading_project_ui:
+            return
+        lang_sel = self.combo_language.currentData() or "auto"
+        proj = self.store.get_active_project()
+        if lang_sel in {"zh", "en"} and lang_sel != self._last_known_lang:
+            cur_tpl = self.template_panel.current_template()
+            proj.set_template_for_language(cur_tpl.language, cur_tpl)
+            target_tpl = proj.get_template_for_language(lang_sel)
+            self._last_known_lang = lang_sel
+            self._suppress_project_template_save = True
+            try:
+                self.template_panel.set_template(target_tpl, emit_signal=False)
+            finally:
+                self._suppress_project_template_save = False
+        self._save_project_settings()
+        self._update_stage_strip()
+
+    def _on_asr_model_changed(self, _idx: int) -> None:
+        if self._loading_project_ui:
+            return
+        model_id = self.combo_asr_model.currentData() or "auto"
+        if model_id == "qwen3_asr_1.7b":
+            warn = check_model_vram_risk("qwen3_asr_1.7b")
+            if warn:
+                self.lbl_status.setText(f"⚠ {warn}")
+                self.anomaly_log_panel.append_log(f"[显存提醒] {warn}")
+        self._save_project_settings()
+        self._update_stage_strip()
 
     def _on_project_switched(self, idx: int) -> None:
         if idx < 0:
@@ -520,7 +770,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "未识别到支持文件",
-                "请拖入 MP4 / MOV / MKV 视频、SRT 字幕，或先导入视频后再拖入台词文稿 (.md/.txt)。",
+                "请拖入粗剪视频（MP4 / MOV / MKV 等）、剧本文稿 (.md/.txt) 或 SRT 字幕。",
             )
             return
 
@@ -540,20 +790,37 @@ class MainWindow(QMainWindow):
                         if nt.script_path and not ex.script_path:
                             ex.script_path = nt.script_path
 
-        if added and not self.current_task_id:
-            self.current_task_id = added[0].task_id
+        if added:
+            disambiguate_episode_labels(self.tasks)
+            if not self.current_task_id:
+                self.current_task_id = added[0].task_id
 
         self.import_panel.set_tasks(self.tasks, self.current_task_id)
+        if len(self.tasks) > 1:
+            idx_b = self.combo_run_scope.findData("batch")
+            if idx_b >= 0 and len(added) > 1:
+                self.combo_run_scope.setCurrentIndex(idx_b)
+        self._update_stage_strip()
         if added:
             script_cnt = sum(1 for t in added if t.script_path)
             extra_note = f"（已自动配对 {script_cnt} 份台词稿）" if script_cnt else ""
             self.anomaly_log_panel.append_log(
                 f"导入 {len(added)} 个剧集任务{extra_note}，正在后台检测视频编码与音轨..."
             )
-            self._probe_worker = MediaProbeWorker(added)
-            self._probe_worker.probed.connect(self._on_media_probed)
-            self._probe_worker.probeFailed.connect(self._on_probe_failed)
-            self._probe_worker.start()
+            worker = MediaProbeWorker(added)
+            self._probe_worker = worker
+            self._probe_workers.append(worker)
+            worker.probed.connect(self._on_media_probed)
+            worker.probeFailed.connect(self._on_probe_failed)
+            worker.finished.connect(lambda w=worker: self._cleanup_probe_worker(w))
+            worker.start()
+
+    def _cleanup_probe_worker(self, worker: MediaProbeWorker) -> None:
+        if worker in self._probe_workers:
+            self._probe_workers.remove(worker)
+        if self._probe_worker is worker:
+            self._probe_worker = None
+        worker.deleteLater()
 
     def _on_user_preset_clicked(self) -> None:
         if self.current_task_id:
@@ -567,7 +834,7 @@ class MainWindow(QMainWindow):
         if task.task_id in self._manual_aspect_tasks or task.template_override is not None:
             return
         cur_tpl = self.template_panel.current_template()
-        if not cur_tpl.is_builtin:
+        if not cur_tpl.is_builtin or cur_tpl.language == "en":
             return
         target_aspect = "16:9" if info.orientation == Orientation.LANDSCAPE else "9:16"
         if cur_tpl.aspect_preset != target_aspect:
@@ -632,7 +899,9 @@ class MainWindow(QMainWindow):
                 manual_points=[],
             )
             self.subtitle_editor.set_data([], self.template_panel.current_template())
+            self.center_bottom_tabs.setTabText(0, "字幕校对编辑 (0)")
             self.anomaly_log_panel.set_anomalies([])
+        self._update_stage_strip()
 
     def _on_audio_track_changed(self, task_id: str, audio_idx: int) -> None:
         task = next((t for t in self.tasks if t.task_id == task_id), None)
@@ -646,16 +915,30 @@ class MainWindow(QMainWindow):
         if task:
             task.srt_path = srt_path
             self.import_panel.set_tasks(self.tasks, task_id)
-            self.anomaly_log_panel.append_log(f"已手动绑定 SRT：{Path(srt_path).name} -> {task.episode_label}")
+            self._update_stage_strip()
+            self.anomaly_log_panel.append_log(f"已手动绑定 SRT：{Path(srt_path).name} -> {task.episode_label}（保留已有文稿）")
 
     def _on_script_bound(self, task_id: str, script_path: str) -> None:
         task = next((t for t in self.tasks if t.task_id == task_id), None)
         if task:
             task.script_path = script_path
             self.import_panel.set_tasks(self.tasks, task_id)
-            self.anomaly_log_panel.append_log(f"已手动绑定台词文稿：{Path(script_path).name} -> {task.episode_label}")
+            self._update_stage_strip()
+            self.anomaly_log_panel.append_log(f"已手动绑定台词文稿：{Path(script_path).name} -> {task.episode_label}（保留已有 SRT）")
+
+    def _on_task_mode_changed(self, task_id: str, mode_val: str) -> None:
+        task = next((t for t in self.tasks if t.task_id == task_id), None)
+        if task:
+            task.task_mode = mode_val  # type: ignore[assignment]
+            self.import_panel.set_tasks(self.tasks, task_id)
+            self._update_stage_strip()
+            self.anomaly_log_panel.append_log(
+                f"已切换 {task.episode_label} 处理模式为：{task.resolve_effective_mode().label_zh}"
+            )
 
     def _on_remove_episode(self, task_id: str) -> None:
+        if self.current_task_id == task_id:
+            self.audio_panel.release_sources()
         self.tasks = [t for t in self.tasks if t.task_id != task_id]
         self.results.pop(task_id, None)
         self._manual_aspect_tasks.discard(task_id)
@@ -675,13 +958,16 @@ class MainWindow(QMainWindow):
                     self.template_panel.apply_aspect_preset("9:16")
                 finally:
                     self._suppress_project_template_save = False
+            self._update_stage_strip()
 
     def _on_template_changed(self, tpl: SubtitleTemplate) -> None:
         if not self.template_panel.chk_unified_batch.isChecked() and self.current_task_id:
             task = next((t for t in self.tasks if t.task_id == self.current_task_id), None)
             if task:
                 task.template_override = deepcopy(tpl)
-        self._save_project_settings()
+        if not self._loading_project_ui:
+            self._sync_project_settings_to_memory()
+            self._save_prefs_timer.start()
 
     def _on_batch_mode_changed(self, unified: bool) -> None:
         self._save_project_settings()
@@ -689,18 +975,29 @@ class MainWindow(QMainWindow):
     def _on_audio_cfg_changed(self, cfg: AudioLevelingConfig) -> None:
         self._save_project_settings()
 
-    def _start_processing(self, batch: bool) -> None:
+    def _start_processing(
+        self,
+        *,
+        batch: bool | None = None,
+        stage_action: str = "full",
+        force_recompute: bool = False,
+    ) -> None:
         if self._proc_worker is not None and self._proc_worker.isRunning():
             QMessageBox.information(self, "处理中", "后台任务正在运行，请等待完成或点击取消。")
             return
         if not self.tasks:
-            QMessageBox.information(self, "请先导入文件", "请先拖入或导入视频（MP4/MOV/MKV）与 SRT 字幕文件。")
+            QMessageBox.information(self, "请先导入文件", "请先拖入或导入粗剪视频（MP4/MOV/MKV 等）、可选文稿或 SRT。")
             return
 
         self._save_project_settings()
         proj = self.store.get_active_project()
 
-        if batch:
+        if batch is None:
+            use_batch = (self.combo_run_scope.currentData() == "batch") and (stage_action == "full")
+        else:
+            use_batch = batch
+
+        if use_batch:
             target_tasks = list(self.tasks)
         else:
             t = next((x for x in self.tasks if x.task_id == self.current_task_id), self.tasks[0])
@@ -716,7 +1013,7 @@ class MainWindow(QMainWindow):
                 tpl = global_tpl
             elif t.template_override:
                 tpl = t.template_override
-            elif global_tpl.is_builtin and t.media_info is not None:
+            elif global_tpl.is_builtin and global_tpl.language != "en" and t.media_info is not None:
                 tpl = (
                     SubtitleTemplate.preset_landscape_16_9()
                     if t.media_info.orientation == Orientation.LANDSCAPE
@@ -729,14 +1026,20 @@ class MainWindow(QMainWindow):
             t.progress = 0.0
             jobs.append((t, deepcopy(tpl), deepcopy(acfg)))
 
+        self._handled_missing_model_tasks.clear()
+        self._last_prog_ui_ts = 0.0
+        self._last_prog_pct = -1
+        self._save_prefs_timer.stop()
+        self.audio_panel.release_sources()
         self.import_panel.set_tasks(self.tasks, self.current_task_id)
-        self.btn_run_one.setEnabled(False)
-        self.btn_run_batch.setEnabled(False)
+        self.btn_start.setEnabled(False)
+        self.btn_stage_actions.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress_bar.setValue(0)
 
         cache_dir = Path(self.store.preferences["model_cache_dir"])
-        work_root = default_app_data_dir() / "workspace_cache"
+        work_root = Path(self.store.preferences.get("work_cache_dir") or default_work_cache_dir(self.store.base_dir))
+        cache_max_mb = int(self.store.preferences.get("cache_max_size_mb", 4096))
 
         self._proc_worker = ProcessingWorker(
             jobs=jobs,
@@ -744,9 +1047,14 @@ class MainWindow(QMainWindow):
             export_cfg=proj.export_config,
             cache_dir=cache_dir,
             work_root=work_root,
+            stage_action=stage_action,  # type: ignore[arg-type]
+            force_recompute=force_recompute,
+            templates_by_lang=proj.active_templates_by_lang,
+            cache_max_size_mb=cache_max_mb,
         )
         self._proc_worker.taskProgress.connect(self._on_task_progress)
         self._proc_worker.taskCompleted.connect(self._on_task_completed)
+        self._proc_worker.missingModel.connect(self._on_missing_model)
         self._proc_worker.taskFailed.connect(self._on_task_failed)
         self._proc_worker.allFinished.connect(self._on_all_finished)
         self._proc_worker.logMessage.connect(self.anomaly_log_panel.append_log)
@@ -763,9 +1071,15 @@ class MainWindow(QMainWindow):
             task.status = "running"
             task.progress = progress
             task.status_message = msg
-        self.lbl_status.setText(f"[{task.episode_label if task else ''}] {msg}")
-        self.progress_bar.setValue(int(progress * 100))
-        self.import_panel.set_tasks(self.tasks, self.current_task_id)
+        pct = int(progress * 100)
+        now = time.monotonic()
+        if pct != self._last_prog_pct or (now - self._last_prog_ui_ts) >= 0.08:
+            self._last_prog_pct = pct
+            self._last_prog_ui_ts = now
+            self.lbl_status.setText(f"[{task.episode_label if task else ''}] {msg}")
+            self.progress_bar.setValue(pct)
+            if task is not None:
+                self.import_panel.update_task_progress(task_id, task)
 
     def _on_task_completed(self, task_id: str, result: PipelineResult) -> None:
         task = next((t for t in self.tasks if t.task_id == task_id), None)
@@ -773,22 +1087,34 @@ class MainWindow(QMainWindow):
             task.status = "done"
             task.progress = 1.0
             task.media_info = result.media_info
+            self.import_panel.update_task_progress(task_id, task)
         self.results[task_id] = result
-        self.import_panel.set_tasks(self.tasks, self.current_task_id)
         if task_id == self.current_task_id:
             self._display_pipeline_result(result)
+        self._update_stage_strip()
+
+    def _on_missing_model(self, task_id: str, model_id: str, err: str) -> None:
+        self._handled_missing_model_tasks.add(task_id)
+        ans = QMessageBox.question(
+            self,
+            "需要下载 AI 语音/对齐模型",
+            f"{err}\n\n是否立即打开「模型下载与缓存管理」下载 {model_id}？",
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self._open_model_manager(highlight_model_id=model_id)
 
     def _on_task_failed(self, task_id: str, err: str) -> None:
         task = next((t for t in self.tasks if t.task_id == task_id), None)
         if task:
             task.status = "error"
             task.error_message = err
-        self.import_panel.set_tasks(self.tasks, self.current_task_id)
-        QMessageBox.warning(self, "处理异常", f"{task.episode_label if task else ''} 处理失败：\n{err}")
+            self.import_panel.update_task_progress(task_id, task)
+        if task_id not in self._handled_missing_model_tasks:
+            QMessageBox.warning(self, "处理异常", f"{task.episode_label if task else ''} 处理失败：\n{err}")
 
     def _on_all_finished(self, cancelled: bool) -> None:
-        self.btn_run_one.setEnabled(True)
-        self.btn_run_batch.setEnabled(True)
+        self.btn_start.setEnabled(True)
+        self.btn_stage_actions.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         if cancelled:
             for t in self.tasks:
@@ -799,6 +1125,47 @@ class MainWindow(QMainWindow):
         else:
             self.progress_bar.setValue(100)
             self.lbl_status.setText("全部处理与导出完成，结果已就绪（可直接导回达芬奇 Studio 20）")
+
+    def _update_stage_strip(self) -> None:
+        cur_task = next((t for t in self.tasks if t.task_id == self.current_task_id), None)
+        if cur_task is None:
+            self.lbl_stage1.setText("① 导入素材：等待导入粗剪视频")
+            self.lbl_stage2.setText("② 字幕识别：语言 - · 模型 - · 对白 0 条 · 异常 0 项")
+            self.lbl_stage3.setText("③ 精修导出：等待对齐、排版与音量均衡")
+            return
+
+        eff_mode = cur_task.resolve_effective_mode().label_zh
+        assets = []
+        if cur_task.script_path:
+            assets.append("文稿")
+        if cur_task.srt_path:
+            assets.append("SRT")
+        asset_note = "+".join(assets) if assets else "仅视频"
+        self.lbl_stage1.setText(f"① 导入素材：{cur_task.episode_label} ({asset_note}) · 模式: {eff_mode}")
+
+        res = self.results.get(cur_task.task_id)
+        if res is None:
+            lang_sel = self.combo_language.currentText()
+            asr_sel = self.combo_asr_model.currentText()
+            self.lbl_stage2.setText(f"② 字幕识别：预设语言 {lang_sel} · ASR {asr_sel} · 待执行")
+            self.lbl_stage3.setText("③ 精修导出：自动对齐 · 排版 · 音量均衡 · 质检导出")
+            return
+
+        lang_disp = "English" if res.detected_language == "en" else "中文"
+        asr_disp = res.asr_model_used or ("已有SRT" if res.task_mode_used == "srt_fix" else "-")
+        match_part = ""
+        if res.script_match_report:
+            conf_pct = int(round(res.script_match_report.get("overall_confidence", 0.0) * 100))
+            match_part = f" · 匹配 {conf_pct}%"
+        self.lbl_stage2.setText(
+            f"② 字幕识别：{lang_disp} · {asr_disp} · 对白 {len(res.processed_cues)} 条{match_part} · 异常 {len(res.anomalies)}"
+        )
+
+        sync_txt = "同步✓" if res.sync_verified else f"偏移{res.sync_diff_ms:+.0f}ms"
+        cache_txt = f" · 缓存({len(res.cache_hits)})" if res.cache_hits else ""
+        self.lbl_stage3.setText(
+            f"③ 精修导出：{res.aligner_used} · {res.audio_report.before_lufs:.1f}→{res.audio_report.after_lufs:.1f} LUFS · {sync_txt}{cache_txt}"
+        )
 
     def _display_pipeline_result(self, res: PipelineResult) -> None:
         self.import_panel.show_media_info(res.media_info, res.audio_report.risk_messages)
@@ -819,12 +1186,25 @@ class MainWindow(QMainWindow):
         )
         self.waveform_widget.sync_scrollbar()
 
-        tpl = self.template_panel.current_template()
-        self.subtitle_editor.set_data(res.processed_cues, tpl)
+        # Sync template language to processed result when auto-detected English/Chinese
+        cur_tpl = self.template_panel.current_template()
+        if res.detected_language != cur_tpl.language:
+            proj = self.store.get_active_project()
+            target_tpl = proj.get_template_for_language(res.detected_language)
+            self._suppress_project_template_save = True
+            try:
+                self.template_panel.set_template(target_tpl, emit_signal=False)
+            finally:
+                self._suppress_project_template_save = False
+            cur_tpl = target_tpl
+
+        self.subtitle_editor.set_data(res.processed_cues, cur_tpl)
+        self.center_bottom_tabs.setTabText(0, f"字幕校对编辑 ({len(res.processed_cues)})")
         self.anomaly_log_panel.set_anomalies(res.anomalies)
         if res.processed_cues:
             sample = " ".join(c.raw_text for c in res.processed_cues[:3]).strip()
             self.template_panel.set_preview_sample_text(sample)
+        self._update_stage_strip()
 
     def _on_cues_edited(self, description: str, before: list[SubtitleCue], after: list[SubtitleCue]) -> None:
         if self.current_task_id not in self.results:
@@ -832,13 +1212,16 @@ class MainWindow(QMainWindow):
         tid = self.current_task_id
 
         def _apply(cues_snapshot: list[SubtitleCue]) -> None:
+            import numpy as np
+
             res = self.results.get(tid)
             if res is None:
                 return
             tpl = self.template_panel.current_template()
             cleaned = normalize_cues_for_resolve(deepcopy(cues_snapshot), min_gap_ms=1)
             res.processed_cues = cleaned
-            audio_16k = self._get_cached_16k(res.extracted_wav_path)
+            cached_a16 = self._audio_16k_cache.get(res.extracted_wav_path)
+            audio_16k = cached_a16 if cached_a16 is not None else np.zeros(0, dtype=np.float32)
             sub_anom = run_quality_checks(
                 cleaned,
                 tpl,
@@ -850,6 +1233,7 @@ class MainWindow(QMainWindow):
             res.anomalies = audio_anom + sub_anom
             if tid == self.current_task_id:
                 self.subtitle_editor.set_data(cleaned, tpl)
+                self.center_bottom_tabs.setTabText(0, f"字幕校对编辑 ({len(cleaned)})")
                 self.waveform_widget.canvas.set_cues(cleaned)
                 self.waveform_widget.canvas.anomalies = res.anomalies
                 self.waveform_widget.canvas.update()
@@ -890,27 +1274,48 @@ class MainWindow(QMainWindow):
         res = self.results.get(self.current_task_id)
         if res is None or not res.processed_cues:
             return
+        if self._relayout_worker is not None and self._relayout_worker.isRunning():
+            return
         tpl = self.template_panel.current_template()
-        before = deepcopy(res.processed_cues)
-        audio_16k = self._get_cached_16k(res.extracted_wav_path)
-        new_cues, _, _ = relayout_cues_with_template(
-            res.processed_cues,
-            tpl,
+        self.lbl_status.setText("正在按当前模板后台重新语义断句...")
+        cached_16k = self._audio_16k_cache.get(res.extracted_wav_path)
+        self._relayout_worker = RelayoutWorker(
+            task_id=self.current_task_id,
+            raw_cues=res.processed_cues,
+            template=tpl,
             duration_ms=res.audio_report.duration_ms,
-            vad_spans=res.vad_spans_ms,
-            audio_16k=audio_16k,
+            vad_spans_ms=res.vad_spans_ms,
+            wav_path=res.extracted_wav_path,
+            cached_16k=cached_16k,
             video_fps=res.media_info.fps if res.media_info else 25.0,
         )
-        self._on_cues_edited("按当前模板重新语义断句", before, new_cues)
-        self.lbl_status.setText(f"已按当前模板 ({tpl.max_chars_per_line}字/{tpl.max_lines}行) 重新断句，共 {len(new_cues)} 条。")
+        self._relayout_worker.finishedOk.connect(self._on_relayout_done)
+        self._relayout_worker.failed.connect(lambda _tid, e: QMessageBox.warning(self, "重排失败", e))
+        self._relayout_worker.start()
+
+    def _on_relayout_done(self, task_id: str, before_cues: object, new_cues: object, a16: object) -> None:
+        res = self.results.get(task_id)
+        if res is None:
+            return
+        if res.extracted_wav_path and a16 is not None:
+            self._audio_16k_cache[res.extracted_wav_path] = a16
+        if task_id != self.current_task_id:
+            return
+        tpl = self.template_panel.current_template()
+        self._on_cues_edited("按当前模板重新语义断句", before_cues, new_cues)
+        self.lbl_status.setText(
+            f"已按当前模板 ({tpl.max_chars_per_line}字/{tpl.max_lines}行) 重新断句，共 {len(new_cues)} 条。"
+        )
 
     def _relevel_current_audio(self) -> None:
         res = self.results.get(self.current_task_id)
         if res is None or not res.extracted_wav_path:
-            QMessageBox.information(self, "提示", "请先运行「一键智能修正」提取音轨后再重新应用音量均衡。")
+            QMessageBox.information(self, "提示", "请先点击「开始处理」提取音轨后再重新应用音量均衡。")
             return
         if self._relevel_worker and self._relevel_worker.isRunning():
             return
+        if not res.processed_wav_path:
+            res.processed_wav_path = str(Path(res.extracted_wav_path).with_name(f"{res.episode_label}_relevel.wav"))
 
         self.audio_panel.release_sources()
         self.lbl_status.setText("正在按新参数与人工增益节点重新计算 48kHz 音频...")
@@ -1007,15 +1412,20 @@ class MainWindow(QMainWindow):
         self.audio_panel.scrub_to_ms(ms)
         self._sync_live_preview_at_ms(ms)
 
+    def _on_canvas_playhead_scrub_ended(self) -> None:
+        self.audio_panel._scrubber.stop()
+        self._preview_sync_timer.stop()
+        self._flush_preview_sample_text()
+
     def _on_canvas_playhead_seeked(self, ms: int) -> None:
         self.audio_panel.seek_to_ms(ms)
-        self._sync_live_preview_at_ms(ms)
+        self._sync_live_preview_at_ms(ms, immediate=True)
 
     def _on_playhead_moved(self, ms: int) -> None:
         self.waveform_widget.canvas.set_playhead(ms)
         self._sync_live_preview_at_ms(ms)
 
-    def _sync_live_preview_at_ms(self, ms: int) -> None:
+    def _sync_live_preview_at_ms(self, ms: int, *, immediate: bool = False) -> None:
         cues = self.waveform_widget.canvas.cues
         if not cues:
             return
@@ -1028,7 +1438,16 @@ class MainWindow(QMainWindow):
             self._last_scrub_cue_idx = hit_idx
             self.waveform_widget.canvas.set_selected_cue(hit_idx)
             self.subtitle_editor.select_cue_index(hit_idx)
-            self.template_panel.set_preview_sample_text(cues[hit_idx].raw_text)
+            self._pending_preview_text = cues[hit_idx].raw_text
+            if immediate:
+                self._preview_sync_timer.stop()
+                self._flush_preview_sample_text()
+            else:
+                self._preview_sync_timer.start()
+
+    def _flush_preview_sample_text(self) -> None:
+        if self._pending_preview_text:
+            self.template_panel.set_preview_sample_text(self._pending_preview_text)
 
     def eventFilter(self, obj, event) -> bool:
         etype = event.type()
@@ -1108,13 +1527,56 @@ class MainWindow(QMainWindow):
             self.store.preferences["theme_mode"] = normalized
             self.store.save_prefs()
 
-    def _open_model_manager(self) -> None:
-        dlg = ModelManagerDialog(self.store, self)
+    def _open_model_manager(self, *, highlight_model_id: str = "") -> None:
+        dlg = ModelManagerDialog(self.store, self, highlight_model_id=highlight_model_id)
         dlg.exec()
 
+    def _open_engine_settings(self) -> None:
+        self._engine_settings_dlg.exec()
+        self._refresh_engine_settings_summary()
+
+    def _refresh_engine_settings_summary(self) -> None:
+        align_txt = self.combo_aligner.currentText().split("(")[0].strip()
+        dev_txt = self.combo_device.currentText().split("(")[0].strip()
+        bit_txt = f"{self.combo_bit_depth.currentData() or 24}-bit"
+        mux_txt = " · 合成MP4" if self.chk_mux_mp4.isChecked() else ""
+        self.btn_engine_settings.setToolTip(
+            f"当前参数：对齐={align_txt} · 设备={dev_txt} · 音频={bit_txt}/48k{mux_txt}\n"
+            "点击打开二级设置修改强制对齐引擎、计算设备与导出格式"
+        )
+
+    def _toggle_side_panel(self, which: str, visible: bool) -> None:
+        if which == "import":
+            self.import_panel.setVisible(visible)
+            self.store.preferences["show_import_panel"] = visible
+        elif which == "template":
+            self.template_panel.setVisible(visible)
+            self.store.preferences["show_template_panel"] = visible
+        self.store.save_prefs()
+
     def closeEvent(self, event) -> None:
+        from drama_studio.align.runtime import MODEL_POOL
+
+        if self._save_prefs_timer.isActive():
+            self._save_prefs_timer.stop()
+            self._save_project_settings()
+        self._preview_sync_timer.stop()
+
+        if self._proc_worker is not None and self._proc_worker.isRunning():
+            self._proc_worker.request_cancel()
+            self._proc_worker.wait(3000)
+        for pw in list(self._probe_workers):
+            if pw.isRunning():
+                pw.requestInterruption()
+                pw.wait(1000)
+        for rw in (self._relevel_worker, self._relayout_worker):
+            if rw is not None and rw.isRunning():
+                rw.requestInterruption()
+                rw.wait(1500)
+
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
         self.audio_panel.release_sources()
+        MODEL_POOL.unload_all()
         super().closeEvent(event)

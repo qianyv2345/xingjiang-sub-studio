@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from drama_studio.audio.leveler import process_voice_leveling
+from drama_studio.audio.leveler import _lookahead_true_peak_limiter, process_voice_leveling
+from drama_studio.audio.loudness import measure_true_peak_dbtp
 from drama_studio.models import AudioLevelingConfig, ManualGainPoint
 
 FX = Path(__file__).resolve().parent / "fixtures"
@@ -85,3 +86,34 @@ def test_manual_gain_point_and_bgm_risk_detection(tmp_path: Path) -> None:
     out_noisy = process_voice_leveling(noisy_wav, tmp_path / "bgm_out.wav", AudioLevelingConfig.from_mode("standard"))
     assert out_noisy.report.bgm_or_sfx_risk is True
     assert len(out_noisy.report.risk_messages) >= 1
+
+
+def test_true_peak_limiter_guarantees_intersample_ceiling_strictly(tmp_path: Path) -> None:
+    sr = 48000
+    n = sr  # 1 second
+    t = np.arange(n, dtype=np.float64) / sr
+    # Construct a classic high-ISP signal: 12 kHz cosine sampled at pi/4 phase has sample peak = 0.707 * amp
+    # while true inter-sample peak = 1.0 * amp (+3.01 dB above sample peak!)
+    amp = 10.0 ** (-1.5 / 20.0) * 1.38  # sample peak ~ -1.7 dBFS, true peak ~ +1.3 dBTP
+    isp_sig = amp * np.cos(2.0 * np.pi * 12000.0 * t + np.pi / 4.0)
+    sample_peak_db = 20.0 * np.log10(float(np.max(np.abs(isp_sig))))
+    raw_tp_db = measure_true_peak_dbtp(isp_sig, oversample=4)
+    assert sample_peak_db < -1.55
+    assert raw_tp_db > 0.5  # Severe inter-sample overshoot despite sample peak below ceiling!
+
+    limited = _lookahead_true_peak_limiter(isp_sig, sr, ceiling_dbtp=-1.5)
+    assert len(limited) == n
+    assert measure_true_peak_dbtp(limited, oversample=4) <= -1.5
+
+    # Also verify full stereo process_voice_leveling respects ceiling strictly
+    stereo = np.stack([isp_sig, -isp_sig], axis=1)
+    in_wav = tmp_path / "isp_stereo.wav"
+    out_wav = tmp_path / "isp_stereo_out.wav"
+    sf.write(str(in_wav), stereo, sr, subtype="PCM_24")
+    cfg = AudioLevelingConfig.from_mode("standard")
+    cfg.true_peak_ceiling_dbtp = -1.5
+    res = process_voice_leveling(in_wav, out_wav, cfg, bit_depth=24)
+    assert len(res.processed_signal) == n
+    assert res.report.after_true_peak_dbtp <= -1.5
+    reloaded, _ = sf.read(str(out_wav), dtype="float64")
+    assert measure_true_peak_dbtp(reloaded, oversample=4) <= -1.5

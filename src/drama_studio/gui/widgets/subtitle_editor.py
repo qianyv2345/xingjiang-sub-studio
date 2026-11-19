@@ -119,76 +119,79 @@ class SubtitleEditorPanel(GlassCard):
 
     def _refresh_table(self) -> None:
         self._updating = True
-        only_anom = self.chk_only_anomaly.isChecked()
-        self._visible_indices = [
-            i for i, c in enumerate(self._cues) if (not only_anom or bool(c.anomaly_flags))
-        ]
-        self.table.setRowCount(len(self._visible_indices))
+        self.table.setUpdatesEnabled(False)
+        try:
+            only_anom = self.chk_only_anomaly.isChecked()
+            self._visible_indices = [
+                i for i, c in enumerate(self._cues) if (not only_anom or bool(c.anomaly_flags))
+            ]
+            self.table.setRowCount(len(self._visible_indices))
 
-        anom_count = sum(1 for c in self._cues if c.anomaly_flags)
-        if self.badge_label is not None:
-            self.badge_label.setText(f"共 {len(self._cues)} 条 · 待核查 {anom_count}")
+            anom_count = sum(1 for c in self._cues if c.anomaly_flags)
+            if self.badge_label is not None:
+                self.badge_label.setText(f"共 {len(self._cues)} 条 · 待核查 {anom_count}")
 
-        pal = get_palette(self._theme_mode)
-        c_warn = QColor("#FBBF24" if pal.is_dark else "#D97706")
-        c_err = QColor(pal.err_text)
-        c_ok = QColor(pal.ok_text)
+            pal = get_palette(self._theme_mode)
+            c_warn = QColor("#FBBF24" if pal.is_dark else "#D97706")
+            c_err = QColor(pal.err_text)
+            c_ok = QColor(pal.ok_text)
 
-        for row, c_idx in enumerate(self._visible_indices):
-            cue = self._cues[c_idx]
-            dur_ms = cue.duration_ms
-            text = cue.effective_text
-            lines = cue.lines()
-            max_w = measure_text_width(text, self._template.width_mode)
-            flat_chars = len(extract_canonical_spoken_sequence(text))
-            cps = flat_chars / max(0.1, dur_ms / 1000.0)
+            for row, c_idx in enumerate(self._visible_indices):
+                cue = self._cues[c_idx]
+                dur_ms = cue.duration_ms
+                text = cue.effective_text
+                lines = cue.lines()
+                max_w = measure_text_width(text, self._template.width_mode)
+                flat_chars = len(extract_canonical_spoken_sequence(text))
+                cps = flat_chars / max(0.1, dur_ms / 1000.0)
 
-            it_idx = QTableWidgetItem(str(c_idx + 1))
-            it_idx.setFlags(it_idx.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            it_idx.setData(Qt.ItemDataRole.UserRole, c_idx)
+                it_idx = QTableWidgetItem(str(c_idx + 1))
+                it_idx.setFlags(it_idx.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                it_idx.setData(Qt.ItemDataRole.UserRole, c_idx)
 
-            time_str = f"{format_srt_time(cue.start_ms)} --> {format_srt_time(cue.end_ms)}"
-            it_time = QTableWidgetItem(time_str)
-            it_time.setFlags(it_time.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                time_str = f"{format_srt_time(cue.start_ms)} --> {format_srt_time(cue.end_ms)}"
+                it_time = QTableWidgetItem(time_str)
+                it_time.setFlags(it_time.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            it_dur = QTableWidgetItem(f"{dur_ms}ms")
-            it_dur.setFlags(it_dur.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if dur_ms < self._template.min_duration_ms or dur_ms > self._template.max_duration_ms:
-                it_dur.setForeground(c_warn)
+                it_dur = QTableWidgetItem(f"{dur_ms}ms")
+                it_dur.setFlags(it_dur.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if dur_ms < self._template.min_duration_ms or dur_ms > self._template.max_duration_ms:
+                    it_dur.setForeground(c_warn)
 
-            it_dim = QTableWidgetItem(f"{max_w:.1f}/{self._template.max_chars_per_line} · {len(lines)}行")
-            it_dim.setFlags(it_dim.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if not width_fits_limit(max_w, self._template.max_chars_per_line) or len(lines) > self._template.max_lines:
-                it_dim.setForeground(c_err)
+                it_dim = QTableWidgetItem(f"{max_w:.1f}/{self._template.max_chars_per_line} · {len(lines)}行")
+                it_dim.setFlags(it_dim.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if not width_fits_limit(max_w, self._template.max_chars_per_line) or len(lines) > self._template.max_lines:
+                    it_dim.setForeground(c_err)
 
-            it_cps = QTableWidgetItem(f"{cps:.1f}/s")
-            it_cps.setFlags(it_cps.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if cps > self._template.max_cps:
-                it_cps.setForeground(c_warn)
+                it_cps = QTableWidgetItem(f"{cps:.1f}/s")
+                it_cps.setFlags(it_cps.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if cps > self._template.max_cps:
+                    it_cps.setForeground(c_warn)
 
-            it_conf = QTableWidgetItem(f"{int(round(cue.confidence * 100))}%")
-            it_conf.setFlags(it_conf.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if cue.confidence < 0.55:
-                it_conf.setForeground(c_err)
-            elif cue.confidence < 0.78:
-                it_conf.setForeground(c_warn)
-            else:
-                it_conf.setForeground(c_ok)
+                it_conf = QTableWidgetItem(f"{int(round(cue.confidence * 100))}%")
+                it_conf.setFlags(it_conf.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if cue.confidence < 0.55:
+                    it_conf.setForeground(c_err)
+                elif cue.confidence < 0.78:
+                    it_conf.setForeground(c_warn)
+                else:
+                    it_conf.setForeground(c_ok)
 
-            it_txt = QTableWidgetItem(text)
-            if cue.anomaly_flags:
-                it_txt.setToolTip("异常标记：" + "；".join(cue.anomaly_flags))
+                it_txt = QTableWidgetItem(text)
+                if cue.anomaly_flags:
+                    it_txt.setToolTip("异常标记：" + "；".join(cue.anomaly_flags))
 
-            self.table.setItem(row, 0, it_idx)
-            self.table.setItem(row, 1, it_time)
-            self.table.setItem(row, 2, it_dur)
-            self.table.setItem(row, 3, it_dim)
-            self.table.setItem(row, 4, it_cps)
-            self.table.setItem(row, 5, it_conf)
-            self.table.setItem(row, 6, it_txt)
-            self.table.setRowHeight(row, 46 if len(lines) >= 2 else 30)
-
-        self._updating = False
+                self.table.setItem(row, 0, it_idx)
+                self.table.setItem(row, 1, it_time)
+                self.table.setItem(row, 2, it_dur)
+                self.table.setItem(row, 3, it_dim)
+                self.table.setItem(row, 4, it_cps)
+                self.table.setItem(row, 5, it_conf)
+                self.table.setItem(row, 6, it_txt)
+                self.table.setRowHeight(row, 46 if len(lines) >= 2 else 30)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self._updating = False
 
     def _selected_cue_indices(self) -> list[int]:
         rows = sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})

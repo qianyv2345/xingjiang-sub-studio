@@ -315,3 +315,195 @@ def test_import_and_undo_redo_in_gui(tmp_path: Path) -> None:
     _cleanup_window(win, app)
     del win
     app.processEvents()
+
+
+def test_mainwindow_nonblocking_progress_relayout_and_scrubber(tmp_path: Path) -> None:
+    import time
+    import numpy as np
+    import soundfile as sf
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from drama_studio.models import (
+        AudioAnalysisReport,
+        EpisodeTask,
+        MediaInfo,
+        Orientation,
+        PipelineResult,
+        SubtitleTemplate,
+    )
+
+    app = _app()
+    store = ConfigStore(base_dir=tmp_path / "cfg_nb")
+    win = MainWindow(store=store)
+
+    wav_in = tmp_path / "in.wav"
+    wav_out = tmp_path / "out.wav"
+    sf.write(str(wav_in), np.zeros((48000 * 2, 1), dtype=np.float32), 48000, subtype="PCM_24")
+    sf.write(str(wav_out), np.zeros((48000 * 2, 1), dtype=np.float32), 48000, subtype="PCM_24")
+
+    task = EpisodeTask(task_id="nb_t1", episode_label="第01集", video_path=str(tmp_path / "ep1.mp4"))
+    win.tasks = [task]
+    win.current_task_id = task.task_id
+    win.import_panel.set_tasks(win.tasks, win.current_task_id)
+
+    display_calls = 0
+    orig_display = win._display_pipeline_result
+
+    def _counted_display(res_obj: PipelineResult) -> None:
+        nonlocal display_calls
+        display_calls += 1
+        orig_display(res_obj)
+
+    win._display_pipeline_result = _counted_display  # type: ignore[method-assign]
+    try:
+        # 20 rapid progress ticks must update cell in-place without calling _display_pipeline_result
+        for k in range(1, 21):
+            win._last_prog_ui_ts = 0.0
+            win._on_task_progress(task.task_id, k * 0.04, f"步骤 {k}")
+        assert display_calls == 0
+        assert win.import_panel.table.rowCount() == 1
+        assert win.import_panel.table.item(0, 3).text() == "80%"
+
+        fake_res = PipelineResult(
+            episode_label=task.episode_label,
+            media_info=MediaInfo(
+                path=task.video_path,
+                file_name="ep1.mp4",
+                format_name="mov,mp4",
+                duration_ms=2000,
+                width=1080,
+                height=1920,
+                fps=30.0,
+                fps_str="30/1",
+                aspect_ratio="9:16",
+                orientation=Orientation.PORTRAIT,
+            ),
+            raw_cues=[
+                SubtitleCue(
+                    index=1,
+                    start_ms=200,
+                    end_ms=1400,
+                    raw_text="测试字幕十个字不够拆吗",
+                    display_text="测试字幕十个字不够拆吗",
+                )
+            ],
+            processed_cues=[
+                SubtitleCue(
+                    index=1,
+                    start_ms=200,
+                    end_ms=1400,
+                    raw_text="测试字幕十个字不够拆吗",
+                    display_text="测试字幕十个字\n不够拆吗",
+                )
+            ],
+            anomalies=[],
+            audio_report=AudioAnalysisReport(
+                sample_rate=48000,
+                channels=1,
+                duration_ms=2000,
+                speech_ratio=0.6,
+                before_lufs=-22.0,
+                after_lufs=-16.0,
+                before_short_term_min_lufs=-26.0,
+                before_short_term_max_lufs=-18.0,
+                after_short_term_min_lufs=-18.0,
+                after_short_term_max_lufs=-15.0,
+                before_lra_lu=6.0,
+                after_lra_lu=2.0,
+                before_peak_dbfs=-3.0,
+                after_peak_dbfs=-1.0,
+                before_true_peak_dbtp=-3.0,
+                after_true_peak_dbtp=-1.0,
+                noise_floor_dbfs=-55.0,
+                estimated_snr_db=28.0,
+                max_applied_gain_db=6.0,
+                min_applied_gain_db=-1.0,
+            ),
+            extracted_wav_path=str(wav_in),
+            processed_wav_path=str(wav_out),
+            vad_spans_ms=[(180, 1450)],
+        )
+        # Task completion must call _display_pipeline_result ONCE (no duplicate refresh)
+        win._on_task_completed(task.task_id, fake_res)
+        assert display_calls == 1
+        assert win.import_panel.table.item(0, 3).text() == "已完成"
+    finally:
+        win._display_pipeline_result = orig_display  # type: ignore[method-assign]
+
+    # _PcmScrubber stores lightweight metadata tuple (sr, ch, frames) & stops on scrub end
+    assert str(wav_out) in win.audio_panel._scrubber._pcm_cache
+    meta_entry = win.audio_panel._scrubber._pcm_cache[str(wav_out)]
+    assert meta_entry == (48000, 1, 96000)
+
+    canvas = win.waveform_widget.canvas
+    scrub_ended: list[bool] = []
+    canvas.playheadScrubEnded.connect(lambda: scrub_ended.append(True))
+    canvas._drag_mode = "playhead"
+    canvas.mouseReleaseEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(100.0, 20.0),
+            QPointF(100.0, 20.0),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+    assert scrub_ended == [True]
+
+    # Off-thread RelayoutWorker executes template update without blocking main thread
+    win.template_panel.set_template(SubtitleTemplate.preset_landscape_16_9(), emit_signal=False)
+    win._relayout_current_subtitles()
+    assert win._relayout_worker is not None
+    deadline = time.monotonic() + 10.0
+    while win._relayout_worker.isRunning() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    app.processEvents()
+    assert not win._relayout_worker.isRunning()
+    assert str(wav_in) in win._audio_16k_cache
+
+    # Sequential drag-drop of same episode name from two projects must disambiguate globally
+    win.tasks.clear()
+    win.current_task_id = ""
+    p_a = tmp_path / "剧集甲" / "第01集.mp4"
+    p_b = tmp_path / "剧集乙" / "第01集.mp4"
+    p_a.parent.mkdir(parents=True)
+    p_b.parent.mkdir(parents=True)
+    p_a.write_bytes(b"stub_a")
+    p_b.write_bytes(b"stub_b")
+    win.import_paths([str(p_a)])
+    win.import_paths([str(p_b)])
+    assert len(win.tasks) == 2
+    labels = [t.episode_label for t in win.tasks]
+    assert len(set(labels)) == 2
+    assert any("剧集甲" in lb for lb in labels)
+    assert any("剧集乙" in lb for lb in labels)
+
+    # Clearing audio sources & starting processing must release QMediaPlayer file handles
+    from unittest.mock import patch
+    from drama_studio.gui.workers import ProcessingWorker
+
+    win.audio_panel.set_audio_sources(str(wav_in), str(wav_out), None)
+    assert win.audio_panel.player.source().isValid()
+    win.audio_panel.set_audio_sources("", "", None)
+    assert not win.audio_panel.player.source().isValid()
+
+    win.tasks = [task]
+    win.current_task_id = task.task_id
+    win.audio_panel.set_audio_sources(str(wav_in), str(wav_out), None)
+    assert win.audio_panel.player.source().isValid()
+    released_before_start: list[bool] = []
+    with patch.object(
+        ProcessingWorker,
+        "start",
+        side_effect=lambda *_args, **_kwargs: released_before_start.append(
+            not win.audio_panel.player.source().isValid()
+        ),
+    ):
+        win._start_processing(stage_action="full", force_recompute=True)
+    assert released_before_start == [True]
+
+    _cleanup_window(win, app)
+    del win
+    app.processEvents()

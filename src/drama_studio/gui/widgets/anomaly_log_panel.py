@@ -26,10 +26,12 @@ class AnomalyAndLogPanel(QWidget):
     """Bottom tabbed glass drawer for anomaly inspection and execution logs."""
 
     anomalyClicked = Signal(int, object)
+    anomaliesCountChanged = Signal(int)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, embedded: bool = False) -> None:
         super().__init__(parent)
         self.setObjectName("TransparentContainer")
+        self._embedded = embedded
         self._anomalies: list[AnomalyItem] = []
         self._theme_mode: str = "light"
         self._build_ui()
@@ -42,11 +44,11 @@ class AnomalyAndLogPanel(QWidget):
     def _build_ui(self) -> None:
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.tabs = QTabWidget()
+        self.tabs: QTabWidget | None = None
 
-        anom_tab = QWidget()
-        anom_tab.setObjectName("TransparentContainer")
-        a_lay = QVBoxLayout(anom_tab)
+        self.anom_page = QWidget()
+        self.anom_page.setObjectName("TransparentContainer")
+        a_lay = QVBoxLayout(self.anom_page)
         a_lay.setContentsMargins(6, 6, 6, 6)
 
         self.table = QTableWidget(0, 5)
@@ -66,9 +68,9 @@ class AnomalyAndLogPanel(QWidget):
         self.table.cellClicked.connect(self._on_cell_clicked)
         a_lay.addWidget(self.table)
 
-        log_tab = QWidget()
-        log_tab.setObjectName("TransparentContainer")
-        l_lay = QVBoxLayout(log_tab)
+        self.log_page = QWidget()
+        self.log_page.setObjectName("TransparentContainer")
+        l_lay = QVBoxLayout(self.log_page)
         l_lay.setContentsMargins(6, 6, 6, 6)
         l_bar = QHBoxLayout()
         btn_clear = QPushButton("清空日志")
@@ -81,13 +83,17 @@ class AnomalyAndLogPanel(QWidget):
         l_lay.addLayout(l_bar)
         l_lay.addWidget(self.log_edit)
 
-        self.tabs.addTab(anom_tab, "异常区间检查 (0)")
-        self.tabs.addTab(log_tab, "运行日志")
-        lay.addWidget(self.tabs)
+        if not self._embedded:
+            self.tabs = QTabWidget()
+            self.tabs.addTab(self.anom_page, "异常区间检查 (0)")
+            self.tabs.addTab(self.log_page, "运行日志")
+            lay.addWidget(self.tabs)
 
     def set_anomalies(self, anomalies: list[AnomalyItem]) -> None:
         self._anomalies = list(anomalies)
-        self.tabs.setTabText(0, f"异常区间检查 ({len(anomalies)})")
+        if self.tabs is not None:
+            self.tabs.setTabText(0, f"异常区间检查 ({len(anomalies)})")
+        self.anomaliesCountChanged.emit(len(anomalies))
         self.table.setRowCount(len(anomalies))
 
         pal = get_palette(self._theme_mode)

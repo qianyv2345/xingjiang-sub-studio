@@ -295,3 +295,119 @@ def test_build_unit_tokens_keeps_sync_when_aligner_drops_decimal_or_hyphen() -> 
     assert abs(tokens[-1].end_ms - char_timings[-1].end_ms) <= 20
     assert tokens[-1].confidence >= 0.90
 
+
+def test_non_invading_padding_preserves_continuous_word_boundaries() -> None:
+    """Pre/post padding must expand only into true silence pauses, never eating continuous neighbor chars."""
+    from drama_studio.align.engine import _apply_padding_and_merge
+
+    tpl = SubtitleTemplate.preset_portrait_9_16()
+    tpl.lead_frames = 3
+    tpl.tail_frames = 3
+    dummy_audio = np.zeros(8000 * 16, dtype=np.float32)
+
+    # 1. Continuous mid-sentence split (0ms gap: '是不是把自己' ends 2160, '攒的银子都花光了' starts 2160)
+    # Followed by tight 80ms pause before '还有呢' (2240..2840) and ample 600ms pause before '好了' (3440..3940).
+    raw_cues = [
+        SubtitleCue(
+            index=1,
+            start_ms=1460,
+            end_ms=2160,
+            raw_text="是不是把自己",
+            display_text="是不是把自己",
+            char_timings=_make_char_timings_for_text("是不是把自己", start_ms=1460, step_ms=116),
+            turn_id=0,
+        ),
+        SubtitleCue(
+            index=2,
+            start_ms=2160,
+            end_ms=3305,
+            raw_text="攒的银子都花光了",
+            display_text="攒的银子都花光了",
+            char_timings=_make_char_timings_for_text("攒的银子都花光了", start_ms=2160, step_ms=143),
+            turn_id=0,
+        ),
+        SubtitleCue(
+            index=3,
+            start_ms=3385,  # 80ms genuine pause after 3305
+            end_ms=4000,
+            raw_text="还有吗？",
+            display_text="还有吗",
+            char_timings=_make_char_timings_for_text("还有吗？", start_ms=3385, step_ms=205),
+            turn_id=0,
+        ),
+        SubtitleCue(
+            index=4,
+            start_ms=4600,  # 600ms genuine pause across turn change
+            end_ms=5100,
+            raw_text="没有。",
+            display_text="没有",
+            char_timings=_make_char_timings_for_text("没有。", start_ms=4600, step_ms=250),
+            turn_id=1,
+        ),
+    ]
+    # Exact char ends match fixture boundaries
+    raw_cues[0].char_timings[-1].end_ms = 2160
+    raw_cues[1].char_timings[-1].end_ms = 3305
+    raw_cues[2].char_timings[-1].end_ms = 4000
+    raw_cues[3].char_timings[-1].end_ms = 5100
+
+    # At 24fps, 3 frames = 125ms
+    padded = _apply_padding_and_merge([SubtitleCue(**{**c.__dict__, "char_timings": list(c.char_timings)}) for c in raw_cues], tpl, 8000, video_fps=24.0)
+    # Outer edges get full 125ms breathing room into silence
+    assert padded[0].start_ms == 1460 - 125
+    assert padded[3].end_ms == 5100 + 125
+    # Continuous 0ms split does NOT steal 125ms from '是不是把自己'
+    assert padded[0].end_ms == 2159
+    assert padded[1].start_ms == 2160
+    # 80ms pause (raw 3305 -> 3385) shares silence proportionally without crossing 3305 or 3385
+    assert 3305 <= padded[1].end_ms < padded[2].start_ms <= 3385
+    assert padded[2].start_ms >= 3305
+    # 600ms cross-turn pause gives full 125ms on both sides while keeping gap >= min_gap_ms
+    assert padded[2].end_ms == 4000 + 125
+    assert padded[3].start_ms == 4600 - 125
+
+    # 2. Relayout from previously polluted stale start/end timings recovers exact non-invading cut
+    stale_cues = [
+        SubtitleCue(
+            index=1,
+            start_ms=1335,
+            end_ms=2034,  # Stale buggy -125ms truncated end
+            raw_text="是不是把自己",
+            display_text="是不是把自己",
+            char_timings=list(raw_cues[0].char_timings),
+            turn_id=0,
+        ),
+        SubtitleCue(
+            index=2,
+            start_ms=2035,  # Stale buggy early start
+            end_ms=3430,
+            raw_text="攒的银子都花光了",
+            display_text="攒的银子都花光了",
+            char_timings=list(raw_cues[1].char_timings),
+            turn_id=0,
+        ),
+    ]
+    relaid, _, ok = relayout_cues_with_template(stale_cues, tpl, duration_ms=8000, vad_spans=[], audio_16k=dummy_audio, video_fps=24.0)
+    assert ok is True
+    assert relaid[0].start_ms == 1335
+    assert relaid[0].end_ms == 2159
+    assert relaid[1].start_ms == 2160
+    assert relaid[1].end_ms == 3430
+
+    # Zero-padding relayout removes breathing room cleanly
+    tpl_zero = SubtitleTemplate.preset_portrait_9_16()
+    tpl_zero.lead_frames = 0
+    tpl_zero.tail_frames = 0
+    relaid_zero, _, _ = relayout_cues_with_template(relaid, tpl_zero, duration_ms=8000, vad_spans=[], audio_16k=dummy_audio, video_fps=24.0)
+    assert relaid_zero[0].start_ms == 1460
+    assert relaid_zero[0].end_ms == 2159
+    assert relaid_zero[1].start_ms == 2160
+    assert relaid_zero[1].end_ms == 3305
+
+    # 3. Unaligned manual cues without char_timings remain idempotent across repeated relayouts
+    manual = [SubtitleCue(index=1, start_ms=1000, end_ms=2000, raw_text="你好", display_text="你好", char_timings=[])]
+    m1, _, _ = relayout_cues_with_template(manual, tpl, duration_ms=8000, vad_spans=[], audio_16k=dummy_audio, video_fps=24.0)
+    m2, _, _ = relayout_cues_with_template(m1, tpl, duration_ms=8000, vad_spans=[], audio_16k=dummy_audio, video_fps=24.0)
+    assert (m1[0].start_ms, m1[0].end_ms) == (1000, 2000)
+    assert (m2[0].start_ms, m2[0].end_ms) == (1000, 2000)
+

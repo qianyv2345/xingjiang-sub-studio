@@ -1,4 +1,4 @@
-"""Smart Chinese semantic segmentation and DP-based single/dual-line subtitle layout engine."""
+"""Smart bilingual (Chinese & English) semantic segmentation and DP single/dual-line subtitle layout engine."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from drama_studio.nlp.punctuation import (
     SECONDARY_PUNCT,
     STRONG_PUNCT,
     classify_trailing_punctuation_strength,
+    count_english_words,
+    detect_text_language,
     extract_canonical_spoken_sequence,
     is_protected_punct,
     normalize_ellipsis_and_dashes,
@@ -36,7 +38,7 @@ _PROTECTED_PHRASES = [
 
 _CONJUNCTIONS = {
     "因为", "所以", "但是", "不过", "而且", "虽然", "可是", "如果", "只要",
-    "除非", "既然", "然而", "于是", "因此", "否则", "哪怕", "即使", "虽然",
+    "除非", "既然", "然而", "于是", "因此", "否则", "哪怕", "即使",
     "然后", "接着", "另外", "其实", "结果", "毕竟", "况且", "何况",
 }
 
@@ -45,11 +47,43 @@ _DISCOURSE_ADVERBS = {
     "本来", "原本", "几乎", "差点", "简直", "到底", "究竟", "万万",
 }
 
-_PREPOSITIONS = {"在", "把", "被", "给", "对", "向", "从", "往", "跟", "和", "替", "为", "向", "朝", "沿", "比"}
+_PREPOSITIONS = {"在", "把", "被", "给", "对", "向", "从", "往", "跟", "和", "替", "为", "朝", "沿", "比"}
 _NEG_ADVERBS = {"不", "没", "没有", "别", "莫", "勿", "很", "太", "真", "最", "更", "都", "也", "就", "才", "还", "再", "又"}
 _AUX_VERBS = {"想", "要", "能", "会", "可以", "应该", "必须", "敢", "愿意", "打算", "准备", "开始"}
 _PARTICLES_ATTACH_LEFT = {"的", "地", "得", "了", "着", "过", "吗", "呢", "吧", "啊", "呀", "嘛", "啦", "呗", "罢了"}
 _PRONOUNS_SHORT = {"我", "你", "他", "她", "它", "这", "那", "谁"}
+
+# English syntactic & lexical grouping constants
+_EN_TITLE_ABBREVS = {"dr.", "mr.", "mrs.", "ms.", "prof.", "sr.", "jr.", "st.", "rev.", "capt.", "gen."}
+_EN_MULTIWORD_COMPOUNDS = {
+    ("new", "york"), ("los", "angeles"), ("san", "francisco"), ("las", "vegas"),
+    ("united", "states"), ("white", "house"), ("high", "school"), ("hong", "kong"),
+    ("prime", "minister"), ("ice", "cream"), ("cell", "phone"), ("next", "door"),
+    ("right", "now"), ("each", "other"), ("of", "course"), ("at", "least"),
+}
+_EN_DETERMINERS = {
+    "a", "an", "the", "this", "that", "these", "those",
+    "my", "your", "his", "her", "its", "our", "their",
+    "some", "any", "no", "every", "each", "either", "neither",
+}
+_EN_AUXILIARIES = {
+    "am", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+}
+_EN_PREPOSITIONS = {
+    "in", "on", "at", "to", "for", "with", "from", "by", "of", "about",
+    "into", "onto", "over", "under", "after", "before", "between", "through",
+    "during", "without", "within", "against", "toward", "towards", "around",
+}
+_EN_CONJUNCTIONS = {
+    "and", "but", "or", "so", "yet", "nor", "because", "although", "though",
+    "since", "while", "whereas", "when", "whenever", "if", "unless", "until",
+    "whether", "even",
+}
+_EN_CLAUSE_STARTERS = {"that", "which", "who", "whom", "whose", "where", "why", "how"}
+_EN_NEGATIONS = {"not", "never", "n't"}
+_OPENING_WRAP_CHARS = set("“‘([（【「『《〈")
 
 _NLP_INIT_DONE = False
 _HANLP_PIPELINE = None
@@ -79,13 +113,12 @@ def register_custom_words(words: list[str] | tuple[str, ...]) -> None:
 
     for raw in words:
         w = raw.strip()
-        if 2 <= len(w) <= 8 and w not in _REGISTERED_CUSTOM_WORDS:
+        if 2 <= len(w) <= 8 and any("\u4e00" <= c <= "\u9fff" for c in w) and w not in _REGISTERED_CUSTOM_WORDS:
             jieba.add_word(w, freq=50000)
             _REGISTERED_CUSTOM_WORDS.add(w)
 
 
 def _get_hanlp_pipeline():
-    """Optional HanLP pipeline (only loaded if user explicitly selects hanlp backend and it is available)."""
     global _HANLP_PIPELINE
     if _HANLP_PIPELINE is not None:
         return _HANLP_PIPELINE
@@ -106,7 +139,6 @@ def char_visual_width(ch: str, width_mode: Literal["visual", "strict"] = "visual
         return 1.0
     if ch.isspace():
         return 0.35
-    # Half-width ASCII letters, digits, narrow punctuation
     if ord(ch) < 128:
         return 0.55
     return 1.0
@@ -131,7 +163,7 @@ def width_fits_limit(width: float, max_chars: int) -> bool:
 
 @dataclass
 class UnitToken:
-    """An atomic display/alignment unit (usually 1 CJK char or 1 ASCII word/number, plus trailing punct)."""
+    """An atomic display/alignment unit (1 CJK char or 1 English word/number, plus optional leading/trailing punct)."""
 
     text: str
     raw_with_punct: str
@@ -139,6 +171,7 @@ class UnitToken:
     end_ms: int
     confidence: float
     trailing_punct: str = ""
+    leading_punct: str = ""
     pause_after_ms: int = 0
     word_id: int = 0
     pos: str = "x"
@@ -146,6 +179,7 @@ class UnitToken:
     protect_next: bool = False
     turn_id: int = 0
     script_punct_hint: str = ""
+    is_english_word: bool = False
 
 
 def tokenize_with_pos(text: str, nlp_backend: Literal["auto", "jieba", "hanlp"] = "jieba") -> list[tuple[str, str]]:
@@ -172,21 +206,20 @@ def tokenize_with_pos(text: str, nlp_backend: Literal["auto", "jieba", "hanlp"] 
     return pairs
 
 
-def _split_word_into_atomic_units(word: str) -> list[str]:
-    """Keep ASCII alphanumeric runs (words/decimals like 'AI-2026' or '3.14') unbreakable; split CJK char-by-char."""
-    units: list[str] = []
-    buf: list[str] = []
-    for ch in word:
-        if ch.isascii() and (ch.isalnum() or ch in {".", "-", "_", "'", "%"}):
-            buf.append(ch)
-        else:
-            if buf:
-                units.append("".join(buf))
-                buf.clear()
-            units.append(ch)
-    if buf:
-        units.append("".join(buf))
-    return units
+def _is_ascii_word_char(ch: str) -> bool:
+    return ch.isascii() and (ch.isalnum() or ch in {".", "-", "_", "'", "’"})
+
+
+def _is_opening_punct(normalized: str, idx: int) -> bool:
+    ch = normalized[idx]
+    if ch in _OPENING_WRAP_CHARS:
+        return True
+    if ch in {'"', "'"}:
+        prev_ch = normalized[idx - 1] if idx > 0 else ""
+        next_ch = normalized[idx + 1] if idx + 1 < len(normalized) else ""
+        if (idx == 0 or prev_ch.isspace() or prev_ch in _OPENING_WRAP_CHARS) and bool(next_ch and not next_ch.isspace()):
+            return True
+    return False
 
 
 def build_unit_tokens(
@@ -199,46 +232,52 @@ def build_unit_tokens(
     char_turn_ids: list[int] | None = None,
     char_punct_hints: list[str] | None = None,
     extra_phrases: list[str] | None = None,
+    language: str = "auto",
 ) -> list[UnitToken]:
-    """Map raw punctuated text + character timestamps into semantic UnitTokens with boundary metadata."""
+    """Map raw punctuated text + character/word timestamps into semantic UnitTokens with boundary metadata."""
     if extra_phrases:
         register_custom_words(extra_phrases)
     normalized = normalize_ellipsis_and_dashes(raw_text.replace("\n", " ").strip())
     if not normalized:
         return []
 
-    # Step 1: Parse raw text into spoken characters + attached trailing punctuation
-    # Match each spoken char against char_timings sequentially
-    spoken_items: list[tuple[str, str]] = []  # (char, trailing_punct)
+    eff_lang = detect_text_language(normalized) if language == "auto" else language
+
+    # Step 1: Parse raw text into spoken characters + leading/trailing punctuation
+    spoken_items: list[tuple[str, str, str]] = []  # (char, trailing_punct, leading_punct)
+    pending_leading = ""
     i = 0
     n = len(normalized)
     while i < n:
         ch = normalized[i]
         if ch.isspace():
             if spoken_items and not spoken_items[-1][1].endswith(" "):
-                prev_ch, prev_p = spoken_items[-1]
-                # Preserve space after ASCII alphanumeric for word spacing
-                if prev_ch.isascii() and prev_ch.isalnum():
-                    spoken_items[-1] = (prev_ch, prev_p + " ")
+                prev_ch, prev_p, prev_l = spoken_items[-1]
+                if prev_ch.isascii() and (prev_ch.isalnum() or prev_ch in {".", "'", "’", "-"}):
+                    spoken_items[-1] = (prev_ch, prev_p + " ", prev_l)
             i += 1
             continue
 
         is_punct = (ch in ALL_PUNCT_CHARS) and not is_protected_punct(normalized, i)
         if is_punct:
-            if spoken_items:
-                prev_ch, prev_p = spoken_items[-1]
-                spoken_items[-1] = (prev_ch, prev_p + ch)
+            if _is_opening_punct(normalized, i):
+                pending_leading += ch
+            elif spoken_items:
+                prev_ch, prev_p, prev_l = spoken_items[-1]
+                spoken_items[-1] = (prev_ch, prev_p + ch, prev_l)
+            else:
+                pending_leading += ch
             i += 1
             continue
 
-        # Handle protected multi-char ellipsis or dash only if not spoken
-        spoken_items.append((ch, ""))
+        spoken_items.append((ch, "", pending_leading))
+        pending_leading = ""
         i += 1
 
     if not spoken_items:
         return []
 
-    # Step 2: Assign timestamps from char_timings using global SequenceMatcher (immune to dropped '.'/'-' or minor ASR/SRT diffs)
+    # Step 2: Assign timestamps from char_timings using global SequenceMatcher
     valid_cts = [ct for ct in char_timings if ct.char.strip() != ""]
     n_sp = len(spoken_items)
     total_dur = max(1, fallback_end_ms - fallback_start_ms)
@@ -246,7 +285,7 @@ def build_unit_tokens(
 
     matched_slots: list[tuple[int, int, float] | None] = [None] * n_sp
     if valid_cts:
-        srt_seq = [ch.lower() for ch, _ in spoken_items]
+        srt_seq = [ch.lower() for ch, _, _ in spoken_items]
         align_seq = [ct.char.lower() for ct in valid_cts]
         sm = SequenceMatcher(None, srt_seq, align_seq, autojunk=False)
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -266,7 +305,6 @@ def build_unit_tokens(
                     ce = int(round(span_s + (off + 1) * span_step))
                     matched_slots[i1 + off] = (cs, max(cs + 20, ce), span_conf)
 
-    # Interpolate any unmatched positions (e.g. '.' in 3.14 or '-' in AI-2026) strictly between neighboring anchors
     item_timings: list[tuple[int, int, float]] = [(0, 0, 0.35)] * n_sp
     last_anchor = -1
     next_anchors: list[int] = [-1] * n_sp
@@ -296,88 +334,80 @@ def build_unit_tokens(
         for off in range(run_len):
             cs = int(round(left_ms + off * local_step))
             ce = int(round(left_ms + (off + 1) * local_step))
-            item_timings[run_start + off] = (cs, max(cs + 15, ce), 0.75 if run_len <= 2 and last_anchor >= 0 and nxt_a >= 0 else 0.35)
+            item_timings[run_start + off] = (
+                cs,
+                max(cs + 15, ce),
+                0.75 if run_len <= 2 and last_anchor >= 0 and nxt_a >= 0 else 0.35,
+            )
         k = run_end
 
     # Assign per-spoken-item turn_id and script punctuation hints
     resolved_turns: list[int] = []
     resolved_hints: list[str] = []
     running_turn = 0
-    for idx_sp, (_ch, tp) in enumerate(spoken_items):
-        if char_turn_ids is not None and idx_sp < len(char_turn_ids):
-            t_id = char_turn_ids[idx_sp]
-        else:
-            t_id = running_turn
-        hint = (
-            char_punct_hints[idx_sp]
-            if (char_punct_hints is not None and idx_sp < len(char_punct_hints))
-            else ""
-        )
+    for idx_sp, (_ch, tp, _lp) in enumerate(spoken_items):
+        t_id = char_turn_ids[idx_sp] if (char_turn_ids is not None and idx_sp < len(char_turn_ids)) else running_turn
+        hint = char_punct_hints[idx_sp] if (char_punct_hints is not None and idx_sp < len(char_punct_hints)) else ""
         resolved_turns.append(t_id)
         resolved_hints.append(hint)
         if any(p in STRONG_PUNCT for p in tp) or any(p in STRONG_PUNCT for p in hint):
             running_turn += 1
 
-    # Step 3: Run Chinese NLP segmentation PER CLAUSE & PER TURN (split at punctuation/turn change so
-    # adjacent turns or sentences like "...求你。好！" never merge into a fake word "你好").
-    clauses: list[tuple[int, int, str]] = []
-    c_start = 0
-    for idx_sp, (ch, tp) in enumerate(spoken_items):
-        turn_changed = idx_sp + 1 < len(spoken_items) and resolved_turns[idx_sp] != resolved_turns[idx_sp + 1]
-        hint_break = bool(resolved_hints[idx_sp].strip())
-        if tp.strip() or hint_break or turn_changed or idx_sp == len(spoken_items) - 1:
-            end_sp = idx_sp + 1
-            clause_str = "".join(
-                spoken_items[k][0] + (" " if (" " in spoken_items[k][1] and spoken_items[k][0].isascii()) else "")
-                for k in range(c_start, end_sp)
-            ).strip()
-            clauses.append((c_start, end_sp, clause_str))
-            c_start = end_sp
-
+    # Step 3: Run Chinese NLP segmentation per clause (skip jieba when pure English)
     char_to_word: list[tuple[int, str, bool]] = []
     word_texts: list[str] = []
-    word_poses: list[str] = []
+    if eff_lang != "en":
+        clauses: list[tuple[int, int, str]] = []
+        c_start = 0
+        for idx_sp, (ch, tp, _lp) in enumerate(spoken_items):
+            turn_changed = idx_sp + 1 < len(spoken_items) and resolved_turns[idx_sp] != resolved_turns[idx_sp + 1]
+            hint_break = bool(resolved_hints[idx_sp].strip())
+            if tp.strip() or hint_break or turn_changed or idx_sp == len(spoken_items) - 1:
+                end_sp = idx_sp + 1
+                clause_str = "".join(
+                    spoken_items[k][0] + (" " if (" " in spoken_items[k][1] and spoken_items[k][0].isascii()) else "")
+                    for k in range(c_start, end_sp)
+                ).strip()
+                clauses.append((c_start, end_sp, clause_str))
+                c_start = end_sp
 
-    for _cs, _ce, c_str in clauses:
-        if not c_str:
-            continue
-        word_pos_pairs = tokenize_with_pos(c_str, nlp_backend=nlp_backend)
-        for w_str, pos in word_pos_pairs:
-            w_clean = "".join(c for c in w_str if not c.isspace())
-            if not w_clean:
+        for _cs, _ce, c_str in clauses:
+            if not c_str:
                 continue
-            actual_wid = len(word_texts)
-            word_texts.append(w_clean)
-            word_poses.append(pos)
-            for ci in range(len(w_clean)):
-                char_to_word.append((actual_wid, pos, ci == len(w_clean) - 1))
+            word_pos_pairs = tokenize_with_pos(c_str, nlp_backend=nlp_backend)
+            for w_str, pos in word_pos_pairs:
+                w_clean = "".join(c for c in w_str if not c.isspace())
+                if not w_clean:
+                    continue
+                actual_wid = len(word_texts)
+                word_texts.append(w_clean)
+                for ci in range(len(w_clean)):
+                    char_to_word.append((actual_wid, pos, ci == len(w_clean) - 1))
 
-    # Align spoken_items to char_to_word (robust fallback if counts differ slightly)
     units_per_char: list[tuple[int, str, bool]] = []
-    if len(char_to_word) == len(spoken_items):
+    if eff_lang != "en" and len(char_to_word) == len(spoken_items):
         units_per_char = char_to_word
     else:
         for idx in range(len(spoken_items)):
-            if idx < len(char_to_word):
+            if eff_lang != "en" and idx < len(char_to_word):
                 units_per_char.append(char_to_word[idx])
             else:
                 units_per_char.append((idx, "x", True))
 
-    # Merge ASCII alphanumeric runs into atomic UnitTokens so English words/numbers never split
+    # Merge contiguous ASCII words/contractions/abbreviations/numbers into atomic UnitTokens
     tokens: list[UnitToken] = []
     idx = 0
     m = len(spoken_items)
     while idx < m:
-        ch, tp = spoken_items[idx]
+        ch, tp, lp = spoken_items[idx]
         wid, pos, is_wend = units_per_char[idx]
         s_ms, e_ms, conf = item_timings[idx]
         cur_turn = resolved_turns[idx]
         cur_hint = resolved_hints[idx]
 
-        # Group contiguous ASCII word/number characters that have no punctuation between them
-        if ch.isascii() and (ch.isalnum() or ch in {".", "-", "_"}) and not any(
-            p in ALL_PUNCT_CHARS for p in tp.strip()
-        ):
+        # Contiguous ASCII word/number characters without separating punctuation/spaces
+        has_separator_punct = any(p in (STRONG_PUNCT | SECONDARY_PUNCT | DECORATIVE_PUNCT) for p in tp.strip())
+        if _is_ascii_word_char(ch) and not has_separator_punct and " " not in tp:
             j = idx + 1
             text_buf = [ch]
             conf_sum = conf
@@ -388,19 +418,19 @@ def build_unit_tokens(
             last_pos = pos
             last_wend = is_wend
             while j < m:
-                nch, ntp = spoken_items[j]
-                if " " in last_tp or resolved_turns[j] != cur_turn:
+                nch, ntp, nlp_tok = spoken_items[j]
+                if " " in last_tp or resolved_turns[j] != cur_turn or nlp_tok:
                     break
-                if nch.isascii() and (nch.isalnum() or nch in {".", "-", "_"}):
+                if _is_ascii_word_char(nch):
                     text_buf.append(nch)
-                    ns, ne, nc = item_timings[j]
+                    _ns, ne, nc = item_timings[j]
                     last_end = max(last_end, ne)
                     conf_sum += nc
                     last_tp = ntp
                     last_hint = resolved_hints[j]
                     last_wid, last_pos, last_wend = units_per_char[j]
                     j += 1
-                    if any(p in ALL_PUNCT_CHARS for p in ntp.strip()):
+                    if " " in ntp or any(p in (STRONG_PUNCT | SECONDARY_PUNCT | DECORATIVE_PUNCT) for p in ntp.strip()):
                         break
                 else:
                     break
@@ -409,16 +439,18 @@ def build_unit_tokens(
             tokens.append(
                 UnitToken(
                     text=word_str,
-                    raw_with_punct=word_str + last_tp,
+                    raw_with_punct=lp + word_str + last_tp,
                     start_ms=s_ms,
                     end_ms=last_end,
                     confidence=conf_sum / cnt,
                     trailing_punct=last_tp,
-                    word_id=last_wid,
+                    leading_punct=lp,
+                    word_id=last_wid if eff_lang != "en" else len(tokens),
                     pos=last_pos,
                     is_word_end=last_wend,
                     turn_id=cur_turn,
                     script_punct_hint=last_hint,
+                    is_english_word=any(c.isalpha() and c.isascii() for c in word_str),
                 )
             )
             idx = j
@@ -426,16 +458,18 @@ def build_unit_tokens(
             tokens.append(
                 UnitToken(
                     text=ch,
-                    raw_with_punct=ch + tp,
+                    raw_with_punct=lp + ch + tp,
                     start_ms=s_ms,
                     end_ms=e_ms,
                     confidence=conf,
                     trailing_punct=tp,
-                    word_id=wid,
+                    leading_punct=lp,
+                    word_id=wid if eff_lang != "en" else len(tokens),
                     pos=pos,
                     is_word_end=is_wend,
                     turn_id=cur_turn,
                     script_punct_hint=cur_hint,
+                    is_english_word=ch.isascii() and ch.isalpha(),
                 )
             )
             idx += 1
@@ -450,24 +484,39 @@ def build_unit_tokens(
             curr.protect_next = False
             continue
 
-        # Protect word interior
+        if eff_lang == "en" or (curr.is_english_word and nxt.is_english_word):
+            c_low = curr.text.lower()
+            n_low = nxt.text.lower()
+            # Protect title abbreviations ("Dr. Smith", "Mr. Lee") & known multi-word names ("New York", "U.S.")
+            if c_low in _EN_TITLE_ABBREVS:
+                curr.protect_next = True
+                continue
+            if (c_low, n_low) in _EN_MULTIWORD_COMPOUNDS:
+                curr.protect_next = True
+                continue
+            # Consecutive capitalized proper nouns with no punctuation between them ("John Smith")
+            if (
+                not curr.trailing_punct.strip()
+                and curr.text[:1].isupper()
+                and nxt.text[:1].isupper()
+                and len(curr.text) >= 2
+                and len(nxt.text) >= 2
+                and c_low not in {"i"}
+                and curr.pause_after_ms < 160
+            ):
+                curr.protect_next = True
+            continue
+
         if curr.word_id == nxt.word_id:
             curr.protect_next = True
             continue
 
-        # Protect numeral + classifier/noun (e.g., 三十万 / 两个人)
         if curr.pos == "m" and nxt.pos in {"q", "m", "n"}:
             curr.protect_next = True
 
-        # Protect negation/adverb before single-syllable verb/adj if not punctuated
-        curr_word = word_texts[curr.word_id] if curr.word_id < len(word_texts) else curr.text
-        nxt_word = word_texts[nxt.word_id] if nxt.word_id < len(word_texts) else nxt.text
         if not curr.trailing_punct.strip():
-            if curr_word in _PROTECTED_PHRASES or nxt_word in _PROTECTED_PHRASES:
-                pass
             if curr.pos in {"nr", "ns", "nt"} and nxt.pos in {"nr", "ns", "nt"} and curr.pause_after_ms < 80:
                 curr.protect_next = True
-            # Never split right before particles like 的/地/得/了/着/过
             if nxt.text in _PARTICLES_ATTACH_LEFT and curr.pause_after_ms < 120:
                 curr.protect_next = True
 
@@ -477,24 +526,25 @@ def build_unit_tokens(
 def compute_boundary_cost(
     tokens: list[UnitToken],
     split_idx: int,
+    *,
+    language: str = "auto",
 ) -> float:
-    """Compute semantic + acoustic naturalness cost for splitting between tokens[split_idx-1] and tokens[split_idx].
-
-    Lower cost = more natural break point.
-    """
+    """Compute semantic + acoustic naturalness cost for splitting between tokens[split_idx-1] and tokens[split_idx]."""
     left = tokens[split_idx - 1]
     right = tokens[split_idx]
     if left.turn_id != right.turn_id:
         return -1000.0
     cost = 0.0
 
-    # 1. Word interior protection (strongest non-punct penalty)
-    if left.word_id == right.word_id:
+    is_en = (language == "en") or (language == "auto" and left.is_english_word and right.is_english_word)
+
+    # 1. Word/collocation interior protection
+    if not is_en and left.word_id == right.word_id:
         cost += 4000.0
     elif left.protect_next:
-        cost += 750.0
+        cost += 950.0 if is_en else 750.0
 
-    # 2. Punctuation strength bonus (considering both SRT punctuation and script hint punctuation)
+    # 2. Punctuation strength bonus
     p_strength = max(
         classify_trailing_punctuation_strength(left.trailing_punct),
         classify_trailing_punctuation_strength(left.script_punct_hint),
@@ -519,28 +569,48 @@ def compute_boundary_cost(
     elif pause <= 10 and p_strength == 0.0:
         cost += 25.0
 
-    # 4. Syntactic POS boundary heuristics (only when not separated by punctuation)
+    # 4. Language-specific syntactic boundary heuristics (when not punctuated)
     if p_strength == 0.0:
-        if right.text in _PARTICLES_ATTACH_LEFT:
-            cost += 260.0
-        if left.text in _NEG_ADVERBS and left.pos in {"d", "v"}:
-            cost += 170.0
-        if left.text in _PREPOSITIONS and left.pos == "p":
-            cost += 160.0
-        if left.text in _AUX_VERBS:
-            cost += 110.0
-        if left.pos == "v" and right.text in _PRONOUNS_SHORT and left.pause_after_ms < 100:
-            cost += 180.0
-        if left.text in {"让", "叫", "使", "把", "被", "给"} and right.text in _PRONOUNS_SHORT:
-            cost += 220.0
-        if left.text in {"的", "地", "得"}:
-            cost += 180.0
-        if right.text in _CONJUNCTIONS or right.text in _DISCOURSE_ADVERBS:
-            cost -= 110.0
-        if right.text in {"就", "才", "也", "却", "便"} and left.pos in {"r", "n", "d"} and left.pause_after_ms >= 30:
-            cost -= 45.0
-        if left.text in {"吗", "呢", "吧", "啊", "呀", "嘛", "啦"}:
-            cost -= 90.0
+        if is_en:
+            l_low = left.text.lower()
+            r_low = right.text.lower()
+            if l_low in _EN_DETERMINERS:
+                cost += 240.0
+            if l_low in _EN_AUXILIARIES and r_low not in _EN_CONJUNCTIONS:
+                cost += 165.0
+            if l_low in _EN_PREPOSITIONS:
+                cost += 170.0
+            if l_low in _EN_NEGATIONS:
+                cost += 170.0
+            if l_low == "to" and right.is_english_word:
+                cost += 180.0
+            if r_low in _EN_CONJUNCTIONS:
+                cost -= 145.0
+            elif r_low in _EN_CLAUSE_STARTERS:
+                cost -= 95.0
+            elif r_low in _EN_PREPOSITIONS and l_low not in _EN_AUXILIARIES:
+                cost -= 55.0
+        else:
+            if right.text in _PARTICLES_ATTACH_LEFT:
+                cost += 260.0
+            if left.text in _NEG_ADVERBS and left.pos in {"d", "v"}:
+                cost += 170.0
+            if left.text in _PREPOSITIONS and left.pos == "p":
+                cost += 160.0
+            if left.text in _AUX_VERBS:
+                cost += 110.0
+            if left.pos == "v" and right.text in _PRONOUNS_SHORT and left.pause_after_ms < 100:
+                cost += 180.0
+            if left.text in {"让", "叫", "使", "把", "被", "给"} and right.text in _PRONOUNS_SHORT:
+                cost += 220.0
+            if left.text in {"的", "地", "得"}:
+                cost += 180.0
+            if right.text in _CONJUNCTIONS or right.text in _DISCOURSE_ADVERBS:
+                cost -= 110.0
+            if right.text in {"就", "才", "也", "却", "便"} and left.pos in {"r", "n", "d"} and left.pause_after_ms >= 30:
+                cost -= 45.0
+            if left.text in {"吗", "呢", "吧", "啊", "呀", "嘛", "啦"}:
+                cost -= 90.0
 
     return cost
 
@@ -552,16 +622,21 @@ def _render_slice_text(
     *,
     remove_punctuation: bool,
 ) -> str:
-    """Reconstruct text from token slice [start:end], preserving ASCII spacing and handling punctuation."""
+    """Reconstruct text from token slice [start:end], preserving English spacing and punctuation rules."""
     parts: list[str] = []
     for k in range(start, end):
         tok = tokens[k]
-        parts.append(tok.raw_with_punct)
+        piece = tok.raw_with_punct
+        # Ensure space between consecutive English words even if intermediate punctuation stripped space
+        if k > start and (tokens[k - 1].is_english_word or tok.is_english_word):
+            prev_piece = parts[-1] if parts else ""
+            if prev_piece and not prev_piece[-1].isspace() and not piece[:1].isspace():
+                parts.append(" ")
+        parts.append(piece)
     raw = "".join(parts).strip()
     if remove_punctuation:
         cleaned = strip_display_punctuation(raw)
         return cleaned if cleaned else raw
-    # Strip trailing comma-only at end of display line? Keep raw when remove_punctuation=False
     return raw
 
 
@@ -577,6 +652,25 @@ def _slice_width(
     return measure_flat_width(txt, width_mode=width_mode)
 
 
+def _line_word_constraints_met(
+    line1: str,
+    line2: str | None,
+    template: SubtitleTemplate,
+) -> bool:
+    """Enforce English min-words constraints (line2 minimum applies strictly when 2 lines are rendered)."""
+    if template.language != "en" and not any(c.isascii() and c.isalpha() for c in (line1 + (line2 or ""))):
+        return True
+    if template.language == "en":
+        w1 = count_english_words(line1)
+        if w1 < max(1, int(template.min_words_line1)):
+            return False
+        if line2 is not None:
+            w2 = count_english_words(line2)
+            if w2 < max(1, int(template.min_words_line2)):
+                return False
+    return True
+
+
 def optimize_two_line_wrap(
     tokens: list[UnitToken],
     start: int,
@@ -585,34 +679,47 @@ def optimize_two_line_wrap(
     max_chars_per_line: int,
     width_mode: Literal["visual", "strict"],
     remove_punctuation: bool,
+    language: str = "zh",
+    min_words_line1: int = 1,
+    min_words_line2: int = 2,
+    balance_two_lines: bool = True,
 ) -> tuple[str, bool]:
-    """Find the best semantic two-line wrap inside [start:end], or keep single line if it fits cleanly.
-
-    Returns (formatted_text, fits_constraints).
-    """
+    """Find the best semantic two-line wrap inside [start:end], or keep single line if it fits cleanly."""
     full_text = _render_slice_text(tokens, start, end, remove_punctuation=remove_punctuation)
     full_width = measure_flat_width(full_text, width_mode=width_mode)
 
     if width_fits_limit(full_width, max_chars_per_line):
-        return full_text, True
+        if language != "en" or count_english_words(full_text) >= min_words_line1 or (end - start) <= 1:
+            return full_text, True
 
     best_mid: int | None = None
     best_score = float("inf")
 
     for mid in range(start + 1, end):
-        # Never split inside a protected word unless impossible
-        w1 = _slice_width(tokens, start, mid, width_mode=width_mode, remove_punctuation=remove_punctuation)
-        w2 = _slice_width(tokens, mid, end, width_mode=width_mode, remove_punctuation=remove_punctuation)
+        line1 = _render_slice_text(tokens, start, mid, remove_punctuation=remove_punctuation)
+        line2 = _render_slice_text(tokens, mid, end, remove_punctuation=remove_punctuation)
+        w1 = measure_flat_width(line1, width_mode=width_mode)
+        w2 = measure_flat_width(line2, width_mode=width_mode)
         if not (width_fits_limit(w1, max_chars_per_line) and width_fits_limit(w2, max_chars_per_line)):
             continue
 
-        b_cost = compute_boundary_cost(tokens, mid)
-        # Mild aesthetic balance preference (avoid 9-char line 1 + 1-char line 2 unless strong punct)
-        balance_penalty = abs(w1 - w2) * 4.5
-        if w2 < 2.0 and classify_trailing_punctuation_strength(tokens[mid - 1].trailing_punct) < 0.9:
-            balance_penalty += 120.0
-        if w1 < 2.0 and classify_trailing_punctuation_strength(tokens[mid - 1].trailing_punct) < 0.9:
-            balance_penalty += 120.0
+        if language == "en":
+            wc1 = count_english_words(line1)
+            wc2 = count_english_words(line2)
+            if wc1 < max(1, min_words_line1) or wc2 < max(1, min_words_line2):
+                continue
+
+        b_cost = compute_boundary_cost(tokens, mid, language=language)
+        if balance_two_lines:
+            balance_penalty = abs(w1 - w2) * (6.0 if language == "en" else 4.5)
+        else:
+            balance_penalty = abs(w1 - w2) * 1.0
+
+        if language != "en":
+            if w2 < 2.0 and classify_trailing_punctuation_strength(tokens[mid - 1].trailing_punct) < 0.9:
+                balance_penalty += 120.0
+            if w1 < 2.0 and classify_trailing_punctuation_strength(tokens[mid - 1].trailing_punct) < 0.9:
+                balance_penalty += 120.0
 
         score = b_cost + balance_penalty
         if score < best_score:
@@ -624,7 +731,10 @@ def optimize_two_line_wrap(
         line2 = _render_slice_text(tokens, best_mid, end, remove_punctuation=remove_punctuation)
         return f"{line1}\n{line2}", True
 
-    # Emergency fallback if a single unbreakable token exceeded limit
+    # For English: do NOT force an invalid 2-line wrap violating min_words_line2; let DP split into separate cues
+    if language == "en":
+        return full_text, False
+
     mid = (start + end) // 2
     if mid <= start:
         return full_text, False
@@ -640,21 +750,17 @@ def segment_tokens_dp(
     tokens: list[UnitToken],
     template: SubtitleTemplate,
 ) -> list[tuple[int, int, str, bool]]:
-    """Globally optimal Dynamic Programming subtitle segmentation over UnitTokens.
-
-    Single-line and Dual-line modes run distinct, dedicated layout checks.
-    Returns list of (start_tok_idx, end_tok_idx, formatted_display_text, fits_all_constraints).
-    """
+    """Globally optimal Dynamic Programming subtitle segmentation over UnitTokens."""
     n = len(tokens)
     if n == 0:
         return []
 
     max_chars = max(1, int(template.max_chars_per_line))
     max_lines = 2 if template.max_lines >= 2 else 1
-    width_mode = template.width_mode
+    lang = template.language
+    width_mode: Literal["visual", "strict"] = "strict" if lang == "en" else template.width_mode
     remove_punct = template.remove_punctuation
 
-    # Prefix widths (approximate quick bound) + exact cached slice measurements
     dp = [float("inf")] * (n + 1)
     prev = [-1] * (n + 1)
     chosen_text: dict[tuple[int, int], tuple[str, bool]] = {}
@@ -664,8 +770,7 @@ def segment_tokens_dp(
         if math.isinf(dp[i]):
             continue
 
-        # Boundary cost for starting a new cue at i (0 for start of utterance)
-        split_cost = compute_boundary_cost(tokens, i) if i > 0 else 0.0
+        split_cost = compute_boundary_cost(tokens, i, language=lang) if i > 0 else 0.0
 
         found_valid_from_i = False
         for j in range(i + 1, n + 1):
@@ -673,7 +778,6 @@ def segment_tokens_dp(
                 break
             flat_w = _slice_width(tokens, i, j, width_mode=width_mode, remove_punctuation=remove_punct)
 
-            # Upper bound pruning: max capacity is max_chars * max_lines
             if flat_w > max_chars * max_lines + 0.15 and j > i + 1:
                 break
 
@@ -690,6 +794,10 @@ def segment_tokens_dp(
                     max_chars_per_line=max_chars,
                     width_mode=width_mode,
                     remove_punctuation=remove_punct,
+                    language=lang,
+                    min_words_line1=template.min_words_line1,
+                    min_words_line2=template.min_words_line2,
+                    balance_two_lines=template.balance_two_lines,
                 )
                 if not fits and j > i + 1:
                     continue
@@ -697,13 +805,26 @@ def segment_tokens_dp(
             found_valid_from_i = True
             chosen_text[(i, j)] = (txt, fits)
 
-            # Duration & CPS quality terms
             dur_ms = max(100, tokens[j - 1].end_ms - tokens[i].start_ms)
             dur_sec = dur_ms / 1000.0
             cps = flat_w / max(0.15, dur_sec)
 
-            seg_cost = 40.0  # Base per-cue cost to avoid over-fragmenting into tiny cues
-            if flat_w < 3.0:
+            seg_cost = 40.0
+            if lang == "en":
+                wc = count_english_words(txt)
+                if wc < 2:
+                    has_strong_break = (
+                        (j == n)
+                        or (j < n and tokens[j].turn_id != tokens[j - 1].turn_id)
+                        or max(
+                            classify_trailing_punctuation_strength(tokens[j - 1].trailing_punct),
+                            classify_trailing_punctuation_strength(tokens[j - 1].script_punct_hint),
+                        ) >= 0.9
+                        or tokens[j - 1].pause_after_ms >= 350
+                    )
+                    if not has_strong_break:
+                        seg_cost += 160.0
+            elif flat_w < 3.0:
                 has_strong_break = (
                     (j == n)
                     or (j < n and tokens[j].turn_id != tokens[j - 1].turn_id)
@@ -716,6 +837,7 @@ def segment_tokens_dp(
                 )
                 if not has_strong_break:
                     seg_cost += 180.0
+
             if dur_ms < template.min_duration_ms:
                 seg_cost += (template.min_duration_ms - dur_ms) * 0.15
             if dur_ms > template.max_duration_ms:
@@ -725,7 +847,6 @@ def segment_tokens_dp(
             if not fits:
                 seg_cost += 5000.0
 
-            # Slight preference for balanced natural chunk length without forcing full fill
             if max_lines == 1 and flat_w >= max(3, int(max_chars * 0.45)):
                 seg_cost -= 15.0
             elif max_lines == 2 and flat_w >= max(4, int(max_chars * 0.9)):
@@ -736,7 +857,6 @@ def segment_tokens_dp(
                 dp[j] = total_cost
                 prev[j] = i
 
-        # Safety: if even a single atomic token exceeded max_chars, force advance by 1 token
         if not found_valid_from_i:
             j = i + 1
             txt = _render_slice_text(tokens, i, j, remove_punctuation=remove_punct)
@@ -746,7 +866,6 @@ def segment_tokens_dp(
                 dp[j] = total_cost
                 prev[j] = i
 
-    # Backtrack optimal path
     segments: list[tuple[int, int, str, bool]] = []
     cur = n
     while cur > 0:
@@ -770,18 +889,19 @@ def format_single_cue_without_split(
 ) -> tuple[str, bool]:
     """Layout an existing cue's text (without splitting across multiple cues) according to 1L/2L rules."""
     clean_raw = raw_text.replace("\n", " ").strip()
+    eff_width_mode: Literal["visual", "strict"] = "strict" if template.language == "en" else template.width_mode
     if template.max_lines == 1:
         out = strip_display_punctuation(clean_raw) if template.remove_punctuation else clean_raw
-        fits = width_fits_limit(measure_flat_width(out, template.width_mode), template.max_chars_per_line)
+        fits = width_fits_limit(measure_flat_width(out, eff_width_mode), template.max_chars_per_line)
         return out, fits
 
-    # Dual-line mode: use semantic token wrap
     tokens = build_unit_tokens(
         clean_raw,
         [],
         fallback_start_ms=0,
         fallback_end_ms=1000,
         nlp_backend=nlp_backend,
+        language=template.language,
     )
     if not tokens:
         out = strip_display_punctuation(clean_raw) if template.remove_punctuation else clean_raw
@@ -791,8 +911,12 @@ def format_single_cue_without_split(
         0,
         len(tokens),
         max_chars_per_line=template.max_chars_per_line,
-        width_mode=template.width_mode,
+        width_mode=eff_width_mode,
         remove_punctuation=template.remove_punctuation,
+        language=template.language,
+        min_words_line1=template.min_words_line1,
+        min_words_line2=template.min_words_line2,
+        balance_two_lines=template.balance_two_lines,
     )
 
 

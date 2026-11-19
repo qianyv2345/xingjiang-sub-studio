@@ -1,24 +1,17 @@
-"""FunASR (fa-zh + optional paraformer-zh) forced alignment backend with GPU/CPU fallback."""
+"""FunASR (fa-zh + optional paraformer-zh) backend with stage VRAM pool and GPU/CPU fallback."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-import re
 import tempfile
-import threading
-from typing import Literal
 
 import numpy as np
 import soundfile as sf
 
-from drama_studio.align.base import AlignerOutput
+from drama_studio.align.base import ASRSegment, AlignerOutput
 from drama_studio.align.model_manager import is_model_cached
+from drama_studio.align.runtime import MODEL_POOL, is_oom_error, release_torch_memory, resolve_torch_device
 from drama_studio.models import CharTimestamp
-
-_LOCK = threading.Lock()
-_FA_MODELS: dict[str, object] = {}
-_ASR_MODELS: dict[str, object] = {}
 
 _DIGIT_MAP = {
     "0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
@@ -27,19 +20,7 @@ _DIGIT_MAP = {
 
 
 def _resolve_device(pref: str = "auto", min_free_vram_mb: int = 800) -> str:
-    if pref == "cpu":
-        return "cpu"
-    import torch
-
-    if torch.cuda.is_available():
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info(0)
-            if free_bytes / (1024 * 1024) >= min_free_vram_mb or pref == "cuda":
-                return "cuda:0"
-        except Exception:
-            if pref == "cuda":
-                return "cuda:0"
-    return "cpu"
+    return resolve_torch_device(pref, min_free_vram_mb=min_free_vram_mb)
 
 
 def _expand_numeric_for_acoustic(token: str) -> str:
@@ -61,9 +42,8 @@ def _expand_numeric_for_acoustic(token: str) -> str:
 
 def _split_to_char_mapping(spoken_text: str) -> tuple[str, list[tuple[str, int, int]]]:
     """Build acoustic query string and mapping from each original spoken char to slice in acoustic string."""
-    # Preserve ASCII words/numbers mapped cleanly while mapping 1-to-1 for CJK chars
     acoustic_parts: list[str] = []
-    mapping: list[tuple[str, int, int]] = []  # (orig_char, start_tok_idx, end_tok_idx)
+    mapping: list[tuple[str, int, int]] = []
     tok_cursor = 0
 
     i = 0
@@ -79,7 +59,6 @@ def _split_to_char_mapping(spoken_text: str) -> tuple[str, list[tuple[str, int, 
             tok_cursor += 1
             i += 1
         elif ch.isdigit():
-            # Collect numeric run (with decimal point)
             j = i + 1
             while j < n and (spoken_text[j].isdigit() or (spoken_text[j] == "." and j + 1 < n and spoken_text[j + 1].isdigit())):
                 j += 1
@@ -88,7 +67,6 @@ def _split_to_char_mapping(spoken_text: str) -> tuple[str, list[tuple[str, int, 
             for c_sub in spoken_num:
                 acoustic_parts.append(c_sub)
             end_tok = tok_cursor + max(1, len(spoken_num))
-            # Distribute acoustic sub-tokens evenly across digits of original number
             sub_cnt = max(1, end_tok - tok_cursor)
             orig_len = j - i
             for k in range(orig_len):
@@ -108,14 +86,13 @@ def _split_to_char_mapping(spoken_text: str) -> tuple[str, list[tuple[str, int, 
             tok_cursor += 1
             i = j
         else:
-            # Keep meaningful non-punct symbol if any without feeding invalid punct
             i += 1
 
     return " ".join(acoustic_parts), mapping
 
 
 class FunASRAlignerBackend:
-    """Forced aligner backed by FunASR fa-zh (TP-Aligner) with optional paraformer-zh anchor."""
+    """Forced aligner backed by FunASR fa-zh (TP-Aligner) with optional paraformer-zh ASR."""
 
     name = "FunASR (fa-zh)"
 
@@ -132,51 +109,72 @@ class FunASRAlignerBackend:
         from funasr import AutoModel
 
         dev = _resolve_device(device_pref, min_free_vram_mb=700)
-        key = f"{self.cache_dir}:{dev}"
-        with _LOCK:
-            if key in _FA_MODELS:
-                return _FA_MODELS[key], dev
-            model_dir = str(self.cache_dir / "funasr_fa")
-            try:
-                model = AutoModel(model=model_dir, device=dev, disable_update=True, disable_pbar=True)
-            except Exception:
-                dev = "cpu"
-                key = f"{self.cache_dir}:cpu"
-                if key in _FA_MODELS:
-                    return _FA_MODELS[key], dev
-                model = AutoModel(model=model_dir, device="cpu", disable_update=True, disable_pbar=True)
-            _FA_MODELS[key] = model
+        key = f"funasr_fa:{self.cache_dir}:{dev}"
+        cached = MODEL_POOL.get("aligner", key)
+        if cached is not None:
+            return cached
+
+        model_dir = str(self.cache_dir / "funasr_fa")
+        try:
+            model = AutoModel(model=model_dir, device=dev, disable_update=True, disable_pbar=True)
+            MODEL_POOL.put("aligner", key, model, dev, exclusive_gpu=True)
             return model, dev
+        except Exception:
+            release_torch_memory()
+            dev = "cpu"
+            key = f"funasr_fa:{self.cache_dir}:cpu"
+            cached_cpu = MODEL_POOL.get("aligner", key)
+            if cached_cpu is not None:
+                return cached_cpu
+            model = AutoModel(model=model_dir, device="cpu", disable_update=True, disable_pbar=True)
+            MODEL_POOL.put("aligner", key, model, "cpu", exclusive_gpu=False)
+            return model, "cpu"
 
     def _get_asr_model(self, device_pref: str = "auto"):
         from funasr import AutoModel
 
         dev = _resolve_device(device_pref, min_free_vram_mb=1500)
-        key = f"{self.cache_dir}:{dev}"
-        with _LOCK:
-            if key in _ASR_MODELS:
-                return _ASR_MODELS[key], dev
-            model_dir = str(self.cache_dir / "funasr_asr")
-            try:
-                model = AutoModel(model=model_dir, device=dev, disable_update=True, disable_pbar=True)
-            except Exception:
-                dev = "cpu"
-                key = f"{self.cache_dir}:cpu"
-                if key in _ASR_MODELS:
-                    return _ASR_MODELS[key], dev
-                model = AutoModel(model=model_dir, device="cpu", disable_update=True, disable_pbar=True)
-            _ASR_MODELS[key] = model
+        key = f"funasr_asr:{self.cache_dir}:{dev}"
+        cached = MODEL_POOL.get("asr", key)
+        if cached is not None:
+            return cached
+
+        model_dir = str(self.cache_dir / "funasr_asr")
+        try:
+            model = AutoModel(model=model_dir, device=dev, disable_update=True, disable_pbar=True)
+            MODEL_POOL.put("asr", key, model, dev, exclusive_gpu=True)
             return model, dev
+        except Exception:
+            release_torch_memory()
+            dev = "cpu"
+            key = f"funasr_asr:{self.cache_dir}:cpu"
+            cached_cpu = MODEL_POOL.get("asr", key)
+            if cached_cpu is not None:
+                return cached_cpu
+            model = AutoModel(model=model_dir, device="cpu", disable_update=True, disable_pbar=True)
+            MODEL_POOL.put("asr", key, model, "cpu", exclusive_gpu=False)
+            return model, "cpu"
 
     def transcribe_anchors(self, audio_16k: np.ndarray, *, device: str = "auto") -> list[tuple[str, int, int]]:
         """Run full-timeline Paraformer ASR to locate character-level timeline anchors (handles edit shifts)."""
         if not self.has_asr_anchor() or len(audio_16k) < 1600:
             return []
-        model, _ = self._get_asr_model(device)
-        with tempfile.TemporaryDirectory() as td:
-            wav_p = Path(td) / "asr.wav"
-            sf.write(str(wav_p), audio_16k, 16000, subtype="PCM_16")
-            res = model.generate(input=str(wav_p), batch_size_s=120)
+        model, used_dev = self._get_asr_model(device)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wav_p = Path(td) / "asr.wav"
+                sf.write(str(wav_p), audio_16k, 16000, subtype="PCM_16")
+                res = model.generate(input=str(wav_p), batch_size_s=120)
+        except Exception as exc:
+            if is_oom_error(exc) and used_dev.startswith("cuda"):
+                MODEL_POOL.unload_role("asr")
+                model, _ = self._get_asr_model("cpu")
+                with tempfile.TemporaryDirectory() as td:
+                    wav_p = Path(td) / "asr.wav"
+                    sf.write(str(wav_p), audio_16k, 16000, subtype="PCM_16")
+                    res = model.generate(input=str(wav_p), batch_size_s=120)
+            else:
+                raise
         if not res:
             return []
         text = str(res[0].get("text", "")).replace(" ", "")
@@ -187,6 +185,71 @@ class FunASRAlignerBackend:
                 anchors.append((ch, int(span[0]), int(span[1])))
         return anchors
 
+    def transcribe_windows(
+        self,
+        audio_16k: np.ndarray,
+        windows_ms: list[tuple[int, int]],
+        *,
+        device: str = "auto",
+    ) -> list[ASRSegment]:
+        """Run FunASR Paraformer-ZH over pre-segmented VAD speech windows (Chinese fast ASR)."""
+        if not self.has_asr_anchor() or not windows_ms:
+            return []
+        model, used_dev = self._get_asr_model(device)
+        segments: list[ASRSegment] = []
+        with tempfile.TemporaryDirectory() as td:
+            for idx, (w_s, w_e) in enumerate(windows_ms):
+                s_i = max(0, int(round(w_s * 16.0)))
+                e_i = min(len(audio_16k), int(round(w_e * 16.0)))
+                chunk = audio_16k[s_i:e_i]
+                if len(chunk) < 1600:
+                    continue
+                wav_p = Path(td) / f"seg_{idx}.wav"
+                sf.write(str(wav_p), chunk, 16000, subtype="PCM_16")
+                try:
+                    res = model.generate(input=str(wav_p), batch_size_s=60)
+                except Exception as exc:
+                    if is_oom_error(exc) and used_dev.startswith("cuda"):
+                        MODEL_POOL.unload_role("asr")
+                        model, used_dev = self._get_asr_model("cpu")
+                        res = model.generate(input=str(wav_p), batch_size_s=60)
+                    else:
+                        raise
+                if not res:
+                    continue
+                txt = str(res[0].get("text", "")).strip()
+                if not txt:
+                    continue
+                ts = res[0].get("timestamp") or []
+                compact = txt.replace(" ", "")
+                cts: list[CharTimestamp] = []
+                for ch, span in zip(compact, ts):
+                    if len(span) >= 2:
+                        cts.append(
+                            CharTimestamp(
+                                char=ch,
+                                start_ms=w_s + int(span[0]),
+                                end_ms=w_s + int(span[1]),
+                                confidence=0.88,
+                            )
+                        )
+                seg_s = cts[0].start_ms if cts else w_s
+                seg_e = cts[-1].end_ms if cts else w_e
+                segments.append(
+                    ASRSegment(
+                        start_ms=max(w_s, seg_s),
+                        end_ms=min(w_e, max(seg_s + 80, seg_e)),
+                        text=txt,
+                        language="zh",
+                        confidence=0.88,
+                        model_used=f"FunASR Paraformer-ZH [{used_dev}]",
+                        raw_char_timings=cts,
+                        src_win_start_ms=w_s,
+                        src_win_end_ms=w_e,
+                    )
+                )
+        return segments
+
     def align_utterance(
         self,
         audio_16k: np.ndarray,
@@ -194,9 +257,17 @@ class FunASRAlignerBackend:
         window_end_ms: int,
         spoken_text: str,
         *,
+        language: str = "zh",
         device: str = "auto",
         cache_dir: Path | None = None,
     ) -> AlignerOutput:
+        if (language or "").strip().lower() in {"en", "eng", "english"}:
+            return AlignerOutput(
+                char_timings=[],
+                backend_name=self.name,
+                warnings=["FunASR fa-zh 仅支持中文对齐，英文项目已跳过 fa-zh。"],
+            )
+
         s_idx = max(0, int(round(window_start_ms * 16000 / 1000.0)))
         e_idx = min(len(audio_16k), int(round(window_end_ms * 16000 / 1000.0)))
         segment = audio_16k[s_idx:e_idx]
@@ -208,12 +279,25 @@ class FunASRAlignerBackend:
             return AlignerOutput(char_timings=[], backend_name=self.name)
 
         model, used_dev = self._get_fa_model(device)
-        with tempfile.TemporaryDirectory() as td:
-            wav_p = Path(td) / "seg.wav"
-            txt_p = Path(td) / "txt.txt"
-            sf.write(str(wav_p), segment, 16000, subtype="PCM_16")
-            txt_p.write_text(acoustic_query, encoding="utf-8")
-            res = model.generate(input=(str(wav_p), str(txt_p)), data_type=("sound", "text"))
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wav_p = Path(td) / "seg.wav"
+                txt_p = Path(td) / "txt.txt"
+                sf.write(str(wav_p), segment, 16000, subtype="PCM_16")
+                txt_p.write_text(acoustic_query, encoding="utf-8")
+                res = model.generate(input=(str(wav_p), str(txt_p)), data_type=("sound", "text"))
+        except Exception as exc:
+            if is_oom_error(exc) and used_dev.startswith("cuda"):
+                MODEL_POOL.unload_role("aligner")
+                model, used_dev = self._get_fa_model("cpu")
+                with tempfile.TemporaryDirectory() as td:
+                    wav_p = Path(td) / "seg.wav"
+                    txt_p = Path(td) / "txt.txt"
+                    sf.write(str(wav_p), segment, 16000, subtype="PCM_16")
+                    txt_p.write_text(acoustic_query, encoding="utf-8")
+                    res = model.generate(input=(str(wav_p), str(txt_p)), data_type=("sound", "text"))
+            else:
+                raise
 
         if not res:
             return AlignerOutput(char_timings=[], backend_name=f"{self.name} ({used_dev})")
@@ -228,7 +312,6 @@ class FunASRAlignerBackend:
                 last_idx = min(len(raw_ts) - 1, max(tok_s, tok_e - 1))
                 t_end = int(raw_ts[last_idx][1]) + window_start_ms
                 dur = max(25, t_end - t_start)
-                # Score plausibility of per-char duration (ideal 60..600 ms)
                 conf = 0.92 if 45 <= dur <= 700 else 0.55
                 char_timings.append(
                     CharTimestamp(

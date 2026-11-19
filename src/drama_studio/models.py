@@ -22,6 +22,22 @@ class Orientation(str, Enum):
         }[self]
 
 
+class TaskMode(str, Enum):
+    AUTO = "auto"
+    SCRIPT_MATCH = "script_match"
+    ASR_GENERATE = "asr_generate"
+    SRT_FIX = "srt_fix"
+
+    @property
+    def label_zh(self) -> str:
+        return {
+            TaskMode.AUTO: "自动识别",
+            TaskMode.SCRIPT_MATCH: "文稿匹配",
+            TaskMode.ASR_GENERATE: "自动生成字幕",
+            TaskMode.SRT_FIX: "修正已有 SRT",
+        }[self]
+
+
 class AnomalySeverity(str, Enum):
     INFO = "info"
     WARNING = "warning"
@@ -42,6 +58,11 @@ class AnomalyType(str, Enum):
     HIGH_BGM_RISK = "high_bgm_risk"
     OVER_COMPRESSED_RISK = "over_compressed_risk"
     AV_OFFSET_WARNING = "av_offset_warning"
+    SCRIPT_EXTRA_AUDIO = "script_extra_audio"
+    SCRIPT_MISSING_LINE = "script_missing_line"
+    SCRIPT_DUPLICATE_LINE = "script_duplicate_line"
+    LAYOUT_WARNING = "layout_warning"
+    SYNC_CHECK_WARNING = "sync_check_warning"
 
 
 @dataclass
@@ -128,6 +149,8 @@ class SubtitleCue:
     source_cue_indices: list[int] = field(default_factory=list)
     locked: bool = False
     turn_id: int = 0
+    src_win_start_ms: int = -1
+    src_win_end_ms: int = -1
 
     @property
     def duration_ms(self) -> int:
@@ -148,8 +171,12 @@ class SubtitleTemplate:
     template_id: str
     name: str
     aspect_preset: Literal["9:16", "16:9", "custom"] = "9:16"
+    language: Literal["zh", "en"] = "zh"
     max_chars_per_line: int = 9
     max_lines: int = 1
+    min_words_line1: int = 1
+    min_words_line2: int = 2
+    balance_two_lines: bool = True
     smart_semantic_split: bool = True
     remove_punctuation: bool = True
     width_mode: Literal["visual", "strict"] = "visual"
@@ -184,8 +211,12 @@ class SubtitleTemplate:
             template_id="preset_9_16",
             name="竖屏短剧默认 (9:16)",
             aspect_preset="9:16",
+            language="zh",
             max_chars_per_line=9,
             max_lines=1,
+            min_words_line1=1,
+            min_words_line2=2,
+            balance_two_lines=True,
             smart_semantic_split=True,
             remove_punctuation=True,
             width_mode="visual",
@@ -213,8 +244,12 @@ class SubtitleTemplate:
             template_id="preset_16_9",
             name="横屏短剧默认 (16:9)",
             aspect_preset="16:9",
+            language="zh",
             max_chars_per_line=20,
             max_lines=1,
+            min_words_line1=1,
+            min_words_line2=2,
+            balance_two_lines=True,
             smart_semantic_split=True,
             remove_punctuation=True,
             width_mode="visual",
@@ -231,6 +266,72 @@ class SubtitleTemplate:
             bridge_max_gap_ms=550,
             auto_merge_short=True,
             short_merge_max_chars=3,
+            short_merge_max_gap_ms=350,
+            auto_split_long=True,
+            is_builtin=True,
+        )
+
+    @classmethod
+    def preset_english_default(cls) -> SubtitleTemplate:
+        return cls(
+            template_id="preset_en_default",
+            name="英文标准字幕 (26字符 · 2行)",
+            aspect_preset="16:9",
+            language="en",
+            max_chars_per_line=26,
+            max_lines=2,
+            min_words_line1=1,
+            min_words_line2=2,
+            balance_two_lines=True,
+            smart_semantic_split=True,
+            remove_punctuation=False,
+            width_mode="strict",
+            min_duration_ms=700,
+            max_duration_ms=5500,
+            max_cps=20.0,
+            min_gap_ms=40,
+            padding_unit="frames",
+            lead_frames=2,
+            tail_frames=3,
+            lead_offset_ms=80,
+            tail_offset_ms=120,
+            bridge_sentence_gaps=True,
+            bridge_max_gap_ms=450,
+            auto_merge_short=True,
+            short_merge_max_chars=8,
+            short_merge_max_gap_ms=350,
+            auto_split_long=True,
+            is_builtin=True,
+        )
+
+    @classmethod
+    def preset_english_portrait(cls) -> SubtitleTemplate:
+        return cls(
+            template_id="preset_en_portrait",
+            name="英文竖屏字幕 (22字符 · 2行)",
+            aspect_preset="9:16",
+            language="en",
+            max_chars_per_line=22,
+            max_lines=2,
+            min_words_line1=1,
+            min_words_line2=2,
+            balance_two_lines=True,
+            smart_semantic_split=True,
+            remove_punctuation=False,
+            width_mode="strict",
+            min_duration_ms=700,
+            max_duration_ms=5000,
+            max_cps=20.0,
+            min_gap_ms=40,
+            padding_unit="frames",
+            lead_frames=2,
+            tail_frames=3,
+            lead_offset_ms=80,
+            tail_offset_ms=120,
+            bridge_sentence_gaps=True,
+            bridge_max_gap_ms=450,
+            auto_merge_short=True,
+            short_merge_max_chars=7,
             short_merge_max_gap_ms=350,
             auto_split_long=True,
             is_builtin=True,
@@ -376,13 +477,23 @@ class AnomalyItem:
 
 @dataclass
 class AlignmentConfig:
-    """Forced alignment engine settings."""
+    """ASR recognition and forced alignment engine settings."""
 
     backend: Literal["auto", "funasr", "qwen3", "vad_fallback"] = "auto"
+    asr_model: Literal["auto", "qwen3_asr_0.6b", "qwen3_asr_1.7b", "funasr_asr"] = "auto"
+    language: Literal["auto", "zh", "en"] = "auto"
     device: Literal["auto", "cuda", "cpu"] = "auto"
     low_confidence_threshold: float = 0.55
     detect_global_offset: bool = True
     nlp_backend: Literal["auto", "jieba", "hanlp"] = "jieba"
+    enhance_quiet_speech_for_asr: bool = True
+    allow_vram_auto_downgrade: bool = True
+    allow_vad_fallback: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AlignmentConfig:
+        valid = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in data.items() if k in valid})
 
 
 @dataclass
@@ -396,17 +507,25 @@ class ExportConfig:
     export_muxed_mp4: bool = False
     wav_bit_depth: Literal[16, 24] = 24
     wav_sample_rate: int = 48000
+    overwrite_policy: Literal["auto_rename", "overwrite"] = "auto_rename"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ExportConfig:
+        valid = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in data.items() if k in valid})
 
 
 @dataclass
 class EpisodeTask:
-    """Represents one episode pair (video + SRT) in batch or single view."""
+    """Represents one episode task (video + optional SRT / optional script) in batch or single view."""
 
     task_id: str
     episode_label: str
     video_path: str
     srt_path: str = ""
     script_path: str = ""
+    task_mode: Literal["auto", "script_match", "asr_generate", "srt_fix"] = "auto"
+    language_override: Literal["auto", "zh", "en"] = "auto"
     media_info: MediaInfo | None = None
     selected_audio_index: int = 0
     template_override: SubtitleTemplate | None = None
@@ -415,6 +534,23 @@ class EpisodeTask:
     progress: float = 0.0
     status_message: str = "等待处理"
     error_message: str = ""
+    stage_status: dict[str, str] = field(default_factory=dict)
+
+    def resolve_effective_mode(self) -> TaskMode:
+        """Determine effective processing mode from user choice or available inputs."""
+        if self.task_mode == TaskMode.SCRIPT_MATCH.value:
+            return TaskMode.SCRIPT_MATCH
+        if self.task_mode == TaskMode.SRT_FIX.value:
+            return TaskMode.SRT_FIX
+        if self.task_mode == TaskMode.ASR_GENERATE.value:
+            return TaskMode.ASR_GENERATE
+        has_srt = bool(self.srt_path and self.srt_path.strip())
+        has_script = bool(self.script_path and self.script_path.strip())
+        if has_srt:
+            return TaskMode.SRT_FIX
+        if has_script:
+            return TaskMode.SCRIPT_MATCH
+        return TaskMode.ASR_GENERATE
 
 
 @dataclass
@@ -424,17 +560,48 @@ class ProjectConfig:
     project_id: str
     project_name: str
     active_template: SubtitleTemplate = field(default_factory=SubtitleTemplate.preset_portrait_9_16)
+    active_templates_by_lang: dict[str, SubtitleTemplate] = field(default_factory=dict)
     audio_config: AudioLevelingConfig = field(default_factory=lambda: AudioLevelingConfig.from_mode("standard"))
     alignment_config: AlignmentConfig = field(default_factory=AlignmentConfig)
     export_config: ExportConfig = field(default_factory=ExportConfig)
     batch_use_unified_template: bool = True
     last_output_dir: str = ""
 
+    def __post_init__(self) -> None:
+        if "zh" not in self.active_templates_by_lang:
+            if self.active_template.language == "zh":
+                self.active_templates_by_lang["zh"] = self.active_template
+            else:
+                self.active_templates_by_lang["zh"] = SubtitleTemplate.preset_portrait_9_16()
+        if "en" not in self.active_templates_by_lang:
+            if self.active_template.language == "en":
+                self.active_templates_by_lang["en"] = self.active_template
+            else:
+                self.active_templates_by_lang["en"] = SubtitleTemplate.preset_english_default()
+
+    def get_template_for_language(self, lang: str) -> SubtitleTemplate:
+        norm = "en" if lang == "en" else "zh"
+        if norm in self.active_templates_by_lang:
+            return self.active_templates_by_lang[norm]
+        return (
+            SubtitleTemplate.preset_english_default()
+            if norm == "en"
+            else SubtitleTemplate.preset_portrait_9_16()
+        )
+
+    def set_template_for_language(self, lang: str, tpl: SubtitleTemplate) -> None:
+        norm = "en" if lang == "en" else "zh"
+        self.active_templates_by_lang[norm] = tpl
+        self.active_template = tpl
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
             "project_name": self.project_name,
             "active_template": self.active_template.to_dict(),
+            "active_templates_by_lang": {
+                k: v.to_dict() for k, v in self.active_templates_by_lang.items()
+            },
             "audio_config": self.audio_config.to_dict(),
             "alignment_config": asdict(self.alignment_config),
             "export_config": asdict(self.export_config),
@@ -444,19 +611,26 @@ class ProjectConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProjectConfig:
+        by_lang: dict[str, SubtitleTemplate] = {}
+        raw_by_lang = data.get("active_templates_by_lang")
+        if isinstance(raw_by_lang, dict):
+            for k, v in raw_by_lang.items():
+                if isinstance(v, dict):
+                    by_lang[k] = SubtitleTemplate.from_dict(v)
         return cls(
             project_id=data.get("project_id", "default"),
             project_name=data.get("project_name", "默认短剧项目"),
             active_template=SubtitleTemplate.from_dict(data["active_template"])
             if "active_template" in data
             else SubtitleTemplate.preset_portrait_9_16(),
+            active_templates_by_lang=by_lang,
             audio_config=AudioLevelingConfig.from_dict(data["audio_config"])
             if "audio_config" in data
             else AudioLevelingConfig.from_mode("standard"),
-            alignment_config=AlignmentConfig(**data["alignment_config"])
+            alignment_config=AlignmentConfig.from_dict(data["alignment_config"])
             if "alignment_config" in data
             else AlignmentConfig(),
-            export_config=ExportConfig(**data["export_config"])
+            export_config=ExportConfig.from_dict(data["export_config"])
             if "export_config" in data
             else ExportConfig(),
             batch_use_unified_template=data.get("batch_use_unified_template", True),
@@ -487,3 +661,13 @@ class PipelineResult:
     nlp_used: str = ""
     text_integrity_ok: bool = True
     exported_files: dict[str, str] = field(default_factory=dict)
+    task_mode_used: str = "srt_fix"
+    detected_language: str = "zh"
+    asr_model_used: str = ""
+    asr_segments: list[dict[str, Any]] = field(default_factory=list)
+    script_match_report: dict[str, Any] = field(default_factory=dict)
+    sync_verified: bool = True
+    sync_diff_ms: float = 0.0
+    cache_hits: list[str] = field(default_factory=list)
+    stage_timings_ms: dict[str, int] = field(default_factory=dict)
+    resource_usage: dict[str, Any] = field(default_factory=dict)

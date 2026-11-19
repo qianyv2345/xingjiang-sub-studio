@@ -256,3 +256,61 @@ def test_acoustic_boundary_refinement_and_local_drift_windowing() -> None:
     assert len(wins) == 2
     assert wins[1].window_start_ms <= 4250  # Recovers real speech at 4200 despite 1600ms local SRT drift
 
+
+def test_acoustic_refinement_short_leading_char_and_early_tail_cutoff() -> None:
+    """Short (80-160ms) leading chars in silence must be trimmed, and early-cutoff vowel tails extended."""
+    import numpy as np
+    from drama_studio.align.engine import _refine_char_boundaries_with_acoustics
+    from drama_studio.models import CharTimestamp
+
+    sr = 16000
+    audio = np.zeros(3 * sr, dtype=np.float32)
+    # Real speech burst spans [960ms .. 1620ms]
+    t = np.arange(int(0.66 * sr)) / sr
+    audio[int(0.96 * sr) : int(1.62 * sr)] = 0.25 * np.sin(2 * np.pi * 220.0 * t)
+
+    # Simulate Qwen3 80ms grid starting 60ms early on a 160ms first char and cutting tail 140ms early
+    cts = [
+        CharTimestamp(char="我", start_ms=900, end_ms=1060, confidence=0.94),
+        CharTimestamp(char="也", start_ms=1060, end_ms=1220, confidence=0.94),
+        CharTimestamp(char="是", start_ms=1220, end_ms=1480, confidence=0.94),
+    ]
+    _refine_char_boundaries_with_acoustics(cts, audio, 3000)
+    assert 940 <= cts[0].start_ms <= 970
+    assert 1600 <= cts[-1].end_ms <= 1650
+
+
+def test_atomic_replace_file_retries_transient_lock_and_cleans_up_on_failure(tmp_path: Path) -> None:
+    """Verify atomic_replace_file recovers from transient WinError 5/32 locks and cleans temp files on failure."""
+    from unittest.mock import patch
+    from drama_studio.cache import atomic_replace_file
+
+    dst = tmp_path / "processed_demo.wav"
+    dst.write_bytes(b"old")
+    src = tmp_path / ".tmp_processed_demo.wav"
+    src.write_bytes(b"new")
+
+    real_replace = __import__("os").replace
+    calls = {"n": 0}
+
+    def _flaky_replace(s, d):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(s, d)
+
+    with patch("drama_studio.cache.os.replace", side_effect=_flaky_replace):
+        atomic_replace_file(src, dst, retries=5, initial_delay_sec=0.005)
+    assert calls["n"] == 3
+    assert dst.read_bytes() == b"new"
+    assert not src.exists()
+
+    # Persistent lock cleans up temp file and surfaces clear error
+    src2 = tmp_path / ".tmp_processed_demo.wav"
+    src2.write_bytes(b"new2")
+    with patch("drama_studio.cache.os.replace", side_effect=PermissionError(5, "Access is denied")):
+        with pytest.raises(PermissionError, match="无法替换目标文件"):
+            atomic_replace_file(src2, dst, retries=2, initial_delay_sec=0.002)
+    assert not src2.exists()
+
+

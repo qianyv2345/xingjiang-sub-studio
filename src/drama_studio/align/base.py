@@ -1,4 +1,4 @@
-"""Abstract alignment interfaces and shared confidence/validation primitives."""
+"""Abstract ASR/alignment interfaces and shared data structures."""
 
 from __future__ import annotations
 
@@ -12,8 +12,23 @@ from drama_studio.models import CharTimestamp, SubtitleCue
 
 
 @dataclass
+class ASRSegment:
+    """Coarse speech recognition segment grounded on a VAD timeline window."""
+
+    start_ms: int
+    end_ms: int
+    text: str
+    language: str = "zh"  # "zh" | "en"
+    confidence: float = 0.85
+    model_used: str = ""
+    raw_char_timings: list[CharTimestamp] = field(default_factory=list)
+    src_win_start_ms: int = -1
+    src_win_end_ms: int = -1
+
+
+@dataclass
 class UtteranceWindow:
-    """Contiguous group of SRT cues aligned together within an audio window."""
+    """Contiguous group of cues aligned together within an audio window."""
 
     cues: list[SubtitleCue]
     window_start_ms: int
@@ -23,7 +38,7 @@ class UtteranceWindow:
 
 @dataclass
 class AlignerOutput:
-    """Character-level timestamps produced for a single utterance window."""
+    """Character-level or word-level timestamps produced for a single utterance window."""
 
     char_timings: list[CharTimestamp]
     backend_name: str
@@ -44,6 +59,7 @@ class AlignmentBackend(Protocol):
         window_end_ms: int,
         spoken_text: str,
         *,
+        language: str = "zh",
         device: str = "auto",
         cache_dir: Path | None = None,
     ) -> AlignerOutput:

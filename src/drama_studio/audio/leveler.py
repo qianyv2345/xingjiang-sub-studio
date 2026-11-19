@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import uniform_filter1d
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, resample_poly, sosfiltfilt
 import soundfile as sf
 
-from drama_studio.audio.loudness import measure_loudness, measure_speech_gated_lufs
+from drama_studio.audio.loudness import (
+    find_true_peak_candidate_runs,
+    measure_loudness,
+    measure_speech_gated_lufs,
+    measure_true_peak_dbtp,
+)
 from drama_studio.audio.vad import detect_speech_segments, spans_to_sample_mask
 from drama_studio.models import (
     AudioAnalysisReport,
@@ -152,56 +158,142 @@ def _soft_knee_compressor(
     return signal * gain_lin[:, np.newaxis]
 
 
+def _oversampled_true_peak_envelope(
+    signal: np.ndarray,
+    oversample: int = 4,
+    threshold_hint: float | None = None,
+) -> np.ndarray:
+    """Compute per-sample linked multi-channel true-peak envelope via polyphase oversampling."""
+    n = len(signal)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    def _ch_env(ch: np.ndarray) -> np.ndarray:
+        ch64 = ch.astype(np.float64, copy=False)
+        sample_abs = np.abs(ch64)
+        if threshold_hint is not None and n > 16384:
+            env_out = sample_abs.copy()
+            pad = 64
+            for core_s, core_e in find_true_peak_candidate_runs(sample_abs, threshold_hint):
+                s_i = max(0, core_s - pad)
+                e_i = min(n, core_e + pad)
+                up = np.abs(resample_poly(ch64[s_i:e_i], oversample, 1))
+                trim_l = (core_s - s_i) * oversample
+                seg_len = core_e - core_s
+                need = seg_len * oversample
+                core_up = up[trim_l : trim_l + need]
+                if len(core_up) < need:
+                    core_up = np.pad(core_up, (0, need - len(core_up)), mode="edge")
+                tp_seg = core_up.reshape(seg_len, oversample).max(axis=1)
+                env_out[core_s:core_e] = np.maximum(sample_abs[core_s:core_e], tp_seg)
+            return env_out
+
+        up = np.abs(resample_poly(ch64, oversample, 1))
+        need = n * oversample
+        if len(up) < need:
+            up = np.pad(up, (0, need - len(up)), mode="edge")
+        elif len(up) > need:
+            up = up[:need]
+        tp_per_sample = up.reshape(n, oversample).max(axis=1)
+        return np.maximum(sample_abs, tp_per_sample)
+
+    if signal.ndim == 1:
+        return _ch_env(signal)
+    env = _ch_env(signal[:, 0])
+    for ch_idx in range(1, signal.shape[1]):
+        env = np.maximum(env, _ch_env(signal[:, ch_idx]))
+    return env
+
+
 def _lookahead_true_peak_limiter(
     signal: np.ndarray,
     sample_rate: int,
     ceiling_dbtp: float = -1.5,
     lookahead_ms: float = 5.0,
     release_ms: float = 60.0,
+    oversample: int = 4,
 ) -> np.ndarray:
-    """Linked multi-channel lookahead limiter preventing clipping without distortion."""
+    """Linked multi-channel 4x oversampled lookahead true-peak limiter with closed-loop verification."""
     if len(signal) == 0:
         return signal.copy()
 
-    # Leave 0.15 dB margin for inter-sample true peaks
-    ceiling_lin = 10.0 ** ((ceiling_dbtp - 0.15) / 20.0)
-    abs_peak = np.abs(signal) if signal.ndim == 1 else np.max(np.abs(signal), axis=1)
+    # Fast bypass only when signal is well below ceiling (> 6 dB headroom even for worst-case ISP)
+    ceiling_lin_exact = 10.0 ** (ceiling_dbtp / 20.0)
+    raw_max = float(np.max(np.abs(signal)))
+    if raw_max <= ceiling_lin_exact * 0.5:
+        return signal.copy()
 
-    gain_red = np.where(
-        abs_peak > ceiling_lin,
-        ceiling_lin / np.maximum(abs_peak, 1e-10),
-        1.0,
-    )
-
-    lookahead = max(1, int(round(sample_rate * lookahead_ms / 1000.0)))
-    if 1 < lookahead < len(gain_red):
-        from numpy.lib.stride_tricks import sliding_window_view
-
-        padded = np.pad(gain_red, (0, lookahead), mode="edge")
-        windows = sliding_window_view(padded, lookahead + 1)
-        gain_red = np.min(windows[: len(gain_red)], axis=1)
-
-    if np.all(gain_red >= 1.0 - 1e-8):
-        return signal
-
-    release_coeff = float(np.exp(-1.0 / max(1.0, sample_rate * release_ms / 1000.0)))
+    from numpy.lib.stride_tricks import sliding_window_view
     from scipy.signal import lfilter, lfilter_zi
 
+    target_lin = 10.0 ** ((ceiling_dbtp - 0.05) / 20.0)
+    lookahead = max(1, int(round(sample_rate * lookahead_ms / 1000.0)))
+    # Include a small symmetric tail window to cover 4x polyphase FIR ringing around sharp transients
+    tail_pad = min(16, max(2, lookahead // 8))
+    release_coeff = float(np.exp(-1.0 / max(1.0, sample_rate * release_ms / 1000.0)))
     b = np.array([1.0 - release_coeff])
     a = np.array([1.0, -release_coeff])
-    zi = lfilter_zi(b, a) * gain_red[0]
-    env = gain_red.copy()
-    for _ in range(3):
-        filtered, _ = lfilter(b, a, env, zi=zi)
-        nxt = np.minimum(gain_red, filtered)
-        if np.allclose(nxt, env, atol=1e-7):
-            env = nxt
-            break
-        env = nxt
 
-    if signal.ndim == 1:
-        return signal * env
-    return signal * env[:, np.newaxis]
+    out = signal.astype(np.float64, copy=True)
+
+    for _pass in range(2):
+        tp_env = _oversampled_true_peak_envelope(
+            out,
+            oversample=oversample,
+            threshold_hint=target_lin * 0.45,
+        )
+        gain_red = np.where(
+            tp_env > target_lin,
+            target_lin / np.maximum(tp_env, 1e-10),
+            1.0,
+        )
+        if np.all(gain_red >= 1.0 - 1e-8):
+            break
+
+        win_len = tail_pad + 1 + lookahead
+        if 1 < win_len < len(gain_red) + tail_pad + lookahead:
+            n_g = len(gain_red)
+            if n_g <= 16384:
+                padded = np.pad(gain_red, (tail_pad, lookahead), mode="edge")
+                windows = sliding_window_view(padded, win_len)
+                gain_red = np.min(windows[:n_g], axis=1)
+            else:
+                out_red = np.ones_like(gain_red)
+                for core_s, core_e in find_true_peak_candidate_runs(1.0 - gain_red, 1e-8):
+                    s_w = max(0, core_s - win_len)
+                    e_w = min(n_g, core_e + win_len)
+                    padded = np.pad(gain_red[s_w:e_w], (tail_pad, lookahead), mode="edge")
+                    loc_min = np.min(sliding_window_view(padded, win_len)[: e_w - s_w], axis=1)
+                    s_a = max(0, core_s - lookahead)
+                    e_a = min(n_g, core_e + tail_pad)
+                    out_red[s_a:e_a] = np.minimum(out_red[s_a:e_a], loc_min[s_a - s_w : e_a - s_w])
+                gain_red = out_red
+
+        zi = lfilter_zi(b, a) * gain_red[0]
+        env = gain_red.copy()
+        for _ in range(3):
+            filtered, _ = lfilter(b, a, env, zi=zi)
+            nxt = np.minimum(gain_red, filtered)
+            if np.allclose(nxt, env, atol=1e-7):
+                env = nxt
+                break
+            env = nxt
+
+        if out.ndim == 1:
+            out = out * env
+        else:
+            out = out * env[:, np.newaxis]
+
+        if measure_true_peak_dbtp(out, oversample=oversample) <= ceiling_dbtp:
+            break
+
+    # Final closed-loop 4x True-Peak guarantee: eliminate any residual sub-0.1 dB ISP overshoot
+    final_tp_db = measure_true_peak_dbtp(out, oversample=oversample)
+    if final_tp_db > ceiling_dbtp:
+        trim_lin = 10.0 ** ((ceiling_dbtp - 0.02 - final_tp_db) / 20.0)
+        out = out * trim_lin
+
+    return out
 
 
 def _downsample_peak_envelope(signal: np.ndarray, sample_rate: int, bin_ms: int = 20) -> tuple[list[int], list[float]]:
@@ -401,11 +493,19 @@ def process_voice_leveling(
 
     after_stats = measure_loudness(final_audio, sample_rate)
 
-    # Write output WAV (24-bit or 16-bit PCM)
+    # Write output WAV atomically (24-bit or 16-bit PCM)
+    from drama_studio.cache import atomic_replace_file
+
     out_path = Path(output_wav_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     subtype = "PCM_24" if bit_depth == 24 else "PCM_16"
-    sf.write(str(out_path), final_audio, sample_rate, subtype=subtype)
+    tmp_out = out_path.with_name(f".{out_path.stem}.{os.getpid()}.tmp.wav")
+    try:
+        sf.write(str(tmp_out), final_audio, sample_rate, subtype=subtype, format="WAV")
+        atomic_replace_file(tmp_out, out_path)
+    except Exception:
+        tmp_out.unlink(missing_ok=True)
+        raise
 
     # Build UI visualization curves (20ms bins)
     wf_times, wf_before = _downsample_peak_envelope(data, sample_rate, bin_ms=20)

@@ -13,7 +13,7 @@ from typing import Callable
 
 from drama_studio.models import AudioTrackInfo, MediaInfo, Orientation
 
-SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv"}
+SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg"}
 SUPPORTED_SUBTITLE_EXTS = {".srt"}
 
 
@@ -279,22 +279,22 @@ def extract_audio_to_wav(
     bit_depth: int = 24,
     sync_offset_ms: float = 0.0,
     target_duration_ms: int | None = None,
+    video_start_time_ms: float = 0.0,
 ) -> Path:
-    """Extract an audio track from video to WAV, preserving timeline sync with video PTS=0."""
+    """Extract an audio track from video to WAV, preserving timeline sync with video frame 0."""
     ffmpeg_bin, _ = find_ffmpeg_binaries()
     out = Path(output_wav_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     codec = "pcm_s24le" if bit_depth == 24 else "pcm_s16le"
 
-    filter_parts: list[str] = ["aresample=async=1:first_pts=0"]
-    # Compensate if audio starts later/earlier relative to video start time
-    if sync_offset_ms > 5.0:
-        delay_ms = int(round(sync_offset_ms))
-        filter_parts.append(f"adelay=delays={delay_ms}:all=1")
-    elif sync_offset_ms < -5.0:
-        trim_sec = abs(sync_offset_ms) / 1000.0
-        filter_parts.append(f"atrim=start={trim_sec:.6f},asetpts=PTS-STARTPTS")
+    # aresample=async=1:first_pts=0 automatically pads silence from PTS=0 up to audio stream start_time
+    # (never add extra adelay on top, which previously doubled positive A/V offsets!).
+    # If the video stream itself starts after 0 (video_start_time_ms > 5ms), align to video PTS 0.
+    v_start_samples = max(0, int(round(max(0.0, video_start_time_ms) * sample_rate / 1000.0)))
+    filter_parts: list[str] = [f"aresample=async=1:first_pts={v_start_samples}"]
+    if video_start_time_ms > 5.0:
+        filter_parts.append("asetpts=PTS-STARTPTS")
 
     if target_duration_ms and target_duration_ms > 0:
         dur_sec = target_duration_ms / 1000.0

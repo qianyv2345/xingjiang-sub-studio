@@ -77,31 +77,26 @@ def detect_speech_segments(
     window_size = 512  # 32ms at 16kHz
     context_size = 64
     state = np.zeros((2, 1, 128), dtype=np.float32)
-    context = np.zeros((1, context_size), dtype=np.float32)
 
     num_samples = len(audio_16k)
-    probs: list[float] = []
-    frame_times_ms: list[int] = []
+    n_chunks = (num_samples + window_size - 1) // window_size
+    padded_audio = np.zeros(n_chunks * window_size, dtype=np.float32)
+    padded_audio[:num_samples] = audio_16k.astype(np.float32, copy=False)
 
-    for start in range(0, num_samples, window_size):
-        chunk = audio_16k[start : start + window_size]
-        if len(chunk) < window_size:
-            chunk = np.pad(chunk, (0, window_size - len(chunk)))
-        x = np.concatenate([context, chunk.reshape(1, -1)], axis=1).astype(np.float32)
-        out, state = session.run(
-            None,
-            {
-                "input": x,
-                "state": state,
-                "sr": np.array(16000, dtype=np.int64),
-            },
-        )
-        probs.append(float(np.asarray(out).squeeze()))
-        frame_times_ms.append(int(round(start * 1000.0 / 16000.0)))
-        context = x[:, -context_size:]
+    x_buf = np.zeros((1, context_size + window_size), dtype=np.float32)
+    sr_arr = np.array(16000, dtype=np.int64)
+    inp_dict = {"input": x_buf, "state": state, "sr": sr_arr}
 
-    probs_arr = np.asarray(probs, dtype=np.float32)
-    times_arr = np.asarray(frame_times_ms, dtype=np.int64)
+    probs_arr = np.empty(n_chunks, dtype=np.float32)
+    times_arr = np.rint(np.arange(n_chunks, dtype=np.float64) * (window_size * 1000.0 / 16000.0)).astype(np.int64)
+
+    for idx in range(n_chunks):
+        start = idx * window_size
+        x_buf[0, context_size:] = padded_audio[start : start + window_size]
+        inp_dict["state"] = state
+        out, state = session.run(None, inp_dict)
+        probs_arr[idx] = float(np.asarray(out).squeeze())
+        x_buf[0, :context_size] = x_buf[0, -context_size:]
 
     # Hysteresis state machine to form clean speech segments
     frame_dur_ms = 32

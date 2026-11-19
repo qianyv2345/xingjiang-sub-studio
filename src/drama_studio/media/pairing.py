@@ -213,5 +213,32 @@ def pair_media_files(paths: list[str | Path]) -> tuple[list[EpisodeTask], list[s
             t.episode_label,
         )
     )
+    disambiguate_episode_labels(tasks)
 
     return tasks, [str(s) for s in remaining_srts]
+
+
+def disambiguate_episode_labels(tasks: list[EpisodeTask]) -> None:
+    """Ensure every task in a batch has a unique `episode_label` so exports never collide."""
+    counts: dict[str, int] = {}
+    for t in tasks:
+        counts[t.episode_label] = counts.get(t.episode_label, 0) + 1
+    if all(v <= 1 for v in counts.values()):
+        return
+
+    used: set[str] = set()
+    for t in tasks:
+        lbl = t.episode_label
+        if counts.get(lbl, 0) <= 1 and lbl not in used:
+            used.add(lbl)
+            continue
+        stem = Path(t.video_path).stem
+        parent_name = Path(t.video_path).parent.name
+        candidate = f"{lbl}_{stem}" if stem and stem != lbl else f"{lbl}_{parent_name}"
+        if not candidate or candidate in used:
+            idx = 2
+            while f"{lbl}_{idx}" in used:
+                idx += 1
+            candidate = f"{lbl}_{idx}"
+        t.episode_label = candidate
+        used.add(candidate)
