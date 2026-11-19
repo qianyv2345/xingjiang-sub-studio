@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from drama_studio import __brand_name__
+from drama_studio import __brand_name__, __version__
 from drama_studio.config import ConfigStore
 from drama_studio.gui.main_window import MainWindow
 from drama_studio.gui.theme import build_studio_qss, resolve_asset_path
@@ -60,6 +60,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("XingJiangSubStudio")
     app.setApplicationDisplayName(__brand_name__)
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
     store = ConfigStore(base_dir=Path(smoke_tmp_dir.name)) if smoke_tmp_dir else ConfigStore()
     init_theme = store.preferences.get("theme_mode", "light")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "drama-studio"
-version = "1.0.0"
+version = "1.1.0"
 description = "星酱声幕 · AI 短剧智能音频与字幕修正助手 (DaVinci Resolve Studio 20 / 剪映工作流)"
 readme = "README.md"
 requires-python = ">=3.12"

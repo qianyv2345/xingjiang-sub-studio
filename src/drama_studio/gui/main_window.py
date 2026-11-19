@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from drama_studio import __app_name__, __brand_name__
+from drama_studio import __app_name__, __brand_name__, __version__
 from drama_studio.align.engine import relayout_cues_with_template, run_quality_checks
 from drama_studio.align.model_manager import check_model_vram_risk
 from drama_studio.audio.vad import to_16k_mono
@@ -213,7 +213,7 @@ class MainWindow(QMainWindow):
     def __init__(self, store: ConfigStore | None = None) -> None:
         super().__init__()
         self.store = store or ConfigStore()
-        self.setWindowTitle(__app_name__)
+        self.setWindowTitle(f"{__app_name__} v{__version__}")
         icon_p = resolve_asset_path("app_icon.ico") or resolve_asset_path("app_icon.png")
         if icon_p is not None:
             self.setWindowIcon(QIcon(str(icon_p)))
